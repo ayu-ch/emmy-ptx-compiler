@@ -1,0 +1,110 @@
+"""PTX building blocks: typed values, virtual registers, labels and the instruction stream.
+
+Everything the compiler computes is a `Val`: either a virtual register (`%f3`) or a
+compile-time constant (`42`, `0f3F800000`). Keeping constants as Python numbers until an
+instruction really needs a register lets the compiler fold index arithmetic such as
+`(a0 * 4) + 0` at compile time, and lets `[%rd5+16]` addressing absorb constant offsets.
+
+PTX registers are virtual and unlimited, so every new value gets a fresh one and `ptxas`
+does the real register allocation.
+"""
+
+from __future__ import annotations
+
+import struct
+from dataclasses import dataclass
+
+# Value types the compiler works with, and the register class each one lives in.
+#   s32  - integers: indices, loop counters, axis variables (signed, like C `int`)
+#   u64  - addresses of global memory
+#   f32  - all floating-point math
+#   pred - the 1-bit results of comparisons
+REG_CLASS = {
+    "pred": ("p", ".pred"),
+    "s32": ("r", ".b32"),
+    "u64": ("rd", ".b64"),
+    "f32": ("f", ".f32"),
+    "b16": ("h", ".b16"),
+}
+
+
+def f32_bits(x: float) -> str:
+    """A PTX float literal: `0f` followed by the IEEE-754 bits, so it can never round wrongly."""
+    return "0f" + struct.pack(">f", float(x)).hex().upper()
+
+
+@dataclass(frozen=True)
+class Val:
+    """A typed operand: a register, or a constant whose Python value is in `const`."""
+
+    text: str
+    ty: str
+    const: int | float | bool | None = None
+
+    @property
+    def is_const(self) -> bool:
+        return self.const is not None
+
+    def __str__(self) -> str:
+        return self.text
+
+
+def const_int(v: int) -> Val:
+    return Val(str(int(v)), "s32", int(v))
+
+
+def const_f32(v: float) -> Val:
+    return Val(f32_bits(v), "f32", float(v))
+
+
+def const_pred(v: bool) -> Val:
+    # Predicates have no literal syntax in PTX; `materialize` turns this into a setp.
+    return Val("1" if v else "0", "pred", bool(v))
+
+
+class Emitter:
+    """Collects the kernel body's instructions and hands out registers and labels."""
+
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+        self.counts = {ty: 0 for ty in REG_CLASS}
+        self.n_labels = 0
+
+    def reg(self, ty: str) -> Val:
+        self.counts[ty] += 1
+        prefix, _ = REG_CLASS[ty]
+        return Val(f"%{prefix}{self.counts[ty]}", ty)
+
+    def emit(self, instr: str) -> None:
+        self.lines.append(f"    {instr};")
+
+    def comment(self, text: str) -> None:
+        # PTX rejects non-ASCII anywhere, comments included.
+        self.lines.append(f"    // {text.encode('ascii', 'replace').decode()}")
+
+    def label(self, hint: str) -> str:
+        self.n_labels += 1
+        return f"$L{self.n_labels}_{hint}"
+
+    def place(self, label: str) -> None:
+        self.lines.append(f"{label}:")
+
+    def declarations(self) -> list[str]:
+        """One `.reg` line per register class that was used, sized to the highest number."""
+        out = []
+        for ty, (prefix, ptx_type) in REG_CLASS.items():
+            if self.counts[ty]:
+                out.append(f"    .reg {ptx_type} %{prefix}<{self.counts[ty] + 1}>;")
+        return out
+
+    # ---- turning constants into registers when an instruction needs one ----
+    def materialize(self, v: Val) -> Val:
+        """Return `v` as a register: constants are moved into a fresh one."""
+        if not v.is_const:
+            return v
+        r = self.reg(v.ty)
+        if v.ty == "pred":
+            self.emit(f"setp.ne.s32 {r}, {1 if v.const else 0}, 0")
+        else:
+            self.emit(f"mov.{'b32' if v.ty == 's32' else v.ty} {r}, {v}")
+        return r
