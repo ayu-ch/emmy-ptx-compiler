@@ -81,8 +81,8 @@ class KernelCompiler(IntMath, LoopLowering):
         self.kernel = kernel
         self.launch = launch
         self.target = target
-        # Optimization level: 2 = everything; 1 = no complete unrolling beyond what the IR
-        # asks for; 0 = no optional unrolling and no load hoisting (the smallest PTX).
+        # Optimization level: 2 = everything; 1 = no complete unrolling beyond what the IR asks
+        # for; 0 = the plain lowering: no optional unrolling, load hoisting or load pairing.
         self.level = level
         self.em = Emitter()
         self.init_intmath()
@@ -448,7 +448,7 @@ class KernelCompiler(IntMath, LoopLowering):
             if type(s).__name__ == "Load":
                 if self.hoisted_load(s):
                     continue
-                if len(s.names) == 1:
+                if len(s.names) == 1 and self.level > 0:
                     j = self._paired_load(stmts, i)
                     if j is not None:
                         absorbed.add(j)
@@ -781,9 +781,20 @@ class KernelCompiler(IntMath, LoopLowering):
 
 
 def compile_kernel(graph, kernel, launch: dict, target: str = "sm_89") -> str:
-    """Compile at the highest optimization level whose PTX fits the runner's size limit."""
+    """Compile at the highest optimization level that works and fits the runner's size limit.
+
+    Level 0 is the plain lowering, without the optional transformations, so an IR shape that
+    trips an optimization still compiles.
+    """
     for level in (2, 1, 0):
-        ptx = KernelCompiler(graph, kernel, launch, target, level=level).compile()
-        if len(ptx) <= PTX_SIZE_LIMIT:
-            break
+        try:
+            ptx = KernelCompiler(graph, kernel, launch, target, level=level).compile()
+        except CompileError:
+            raise                                         # unsupported IR: no level helps
+        except Exception:
+            if level == 0:
+                raise
+            continue
+        if len(ptx) <= PTX_SIZE_LIMIT or level == 0:
+            return ptx
     return ptx
