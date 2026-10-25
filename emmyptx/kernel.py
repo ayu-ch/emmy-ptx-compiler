@@ -40,6 +40,15 @@ LOADS_IN_FLIGHT = 16
 UNROLL_BODY_MAX = 40
 # A loop whose trip count is only known to lie in a range is fully unrolled up to this many copies.
 SHORT_LOOP_MAX = 16
+# Constant-trip loops are unrolled completely while the unrolled code stays under this many
+# statements: FLAGGED_UNROLL_STMTS when the IR marks the loop `unroll`, FULL_UNROLL_STMTS for
+# other loops over plain computation.
+FLAGGED_UNROLL_STMTS = 4096
+FULL_UNROLL_STMTS = 512
+# The runner accepts PTX up to 2,000,000 characters; past this the kernel is recompiled lean.
+PTX_SIZE_LIMIT = 1_800_000
+# Loads that do not change across a runtime loop are moved in front of it, up to this many registers.
+HOIST_MAX = 128
 
 # Shared-memory XOR swizzles: mode -> (element shift, row mask), as in Emmy's slab layouts.
 SWIZZLE_XOR = {"B128": (6, 0x7), "B64": (6, 0x3), "B32": (6, 0x1)}
@@ -58,6 +67,7 @@ class Buffer:
     base: Val                # global: a u64 register; shared: an s32 register with its address
     shape: tuple[int, ...]
     dtype: str               # "f32", "f16" or "i32"
+    align: int = 16          # known byte alignment of element 0
 
     @property
     def esize(self) -> int:
@@ -105,6 +115,16 @@ def _walk(body):
             yield from _walk(sub)
 
 
+def _defines(stmt) -> tuple[str, ...]:
+    """The names a leaf statement binds."""
+    kind = type(stmt).__name__
+    if kind == "Load":
+        return tuple(stmt.names)
+    if kind in ("Assign", "Let", "Accum", "Init"):
+        return (stmt.name,)
+    return ()
+
+
 def _dtype_name(dt) -> str | None:
     if dt is None:
         return None
@@ -112,8 +132,9 @@ def _dtype_name(dt) -> str | None:
 
 
 class KernelCompiler:
-    def __init__(self, graph, kernel, launch: dict, target: str = "sm_89") -> None:
+    def __init__(self, graph, kernel, launch: dict, target: str = "sm_89", lean: bool = False) -> None:
         self.kernel = kernel
+        self.lean = lean                           # no optional unrolling or hoisting
         self.launch = launch
         self.target = target
         self.em = Emitter()
@@ -133,6 +154,14 @@ class KernelCompiler:
         # Known value ranges of integer registers (register text -> (lo, hi)), from the tile
         # decode onward. They let a loop whose start depends on the thread still know its trip count.
         self.ranges: dict[str, tuple[int, int]] = {}
+        # Known divisors of integer registers (register text -> d with value % d == 0), which
+        # prove the alignment that merging two scalar loads into one vector load needs.
+        self.mults: dict[str, int] = {}
+        # Buffers the kernel writes (they are never read ahead of time), and the stack of loads
+        # moved in front of the runtime loops being compiled: (buffer, address, width) -> registers.
+        self.written = {getattr(t, "output", None) or getattr(t, "smem", None)
+                        for t in _walk(kernel.body) if type(t).__name__ in ("Write", "CpAsyncCopy")}
+        self.hoisted: list[dict] = []
         # Names whose value is carried across iterations or combine steps: they keep one register.
         self.carried: set[str] = set()
         for s in _walk(kernel.body):
@@ -203,7 +232,7 @@ class KernelCompiler:
                 shape, dtype = tuple(arg.get("shape") or (1,)), arg.get("dtype", "f32")
             if dtype not in ELEM:
                 raise CompileError(f"buffer {name!r} has unsupported dtype {dtype!r}")
-            self.buffers[name] = Buffer(name, "global", r, tuple(shape), dtype)
+            self.buffers[name] = Buffer(name, "global", r, tuple(shape), dtype, align=256)  # cudaMalloc
         self._declare_shared()
         tid = em.reg("s32")
         em.emit(f"mov.u32 {tid}, %tid.x")
@@ -252,7 +281,8 @@ class KernelCompiler:
             else:
                 self.smem_decls.append(f".shared .align {align} .b8 {sym}[{nbytes}];")
                 em.emit(f"mov.u32 {base}, {sym}")
-            self.smem_for[id(s)] = Buffer(s.name, "shared", base, tuple(int(e) for e in s.extents), dtype)
+            self.smem_for[id(s)] = Buffer(s.name, "shared", base, tuple(int(e) for e in s.extents), dtype,
+                                          align=16 if dynamic else align)
         if dynamic and offset > self.launch["smem_bytes"]:
             raise CompileError(f"shared arrays need {offset} bytes, launch provides {self.launch['smem_bytes']}")
 
@@ -435,11 +465,35 @@ class KernelCompiler:
             if op == "%" and k == 1:
                 return const_int(0)
         result = self._iop(op, a, b)
-        if not result.is_const and result.text not in self.ranges:
-            r = self._range_after(op, self.range_of(a), self.range_of(b))
-            if r is not None:
-                self.ranges[result.text] = r
+        if not result.is_const:
+            if result.text not in self.ranges:
+                r = self._range_after(op, self.range_of(a), self.range_of(b))
+                if r is not None:
+                    self.ranges[result.text] = r
+            if result.text not in self.mults:
+                m = self._mult_after(op, a, b)
+                if m > 1:
+                    self.mults[result.text] = m
         return result
+
+    def mult_of(self, v: Val) -> int:
+        """A known divisor of an integer value (1 when nothing is known)."""
+        if v.is_const:
+            return abs(int(v.const)) or 1 << 30
+        if v.text in self.affine:
+            base, k = self.affine[v.text]
+            return math.gcd(self.mult_of(base), abs(k) or 1 << 30)
+        return self.mults.get(v.text, 1)
+
+    def _mult_after(self, op: str, a: Val, b: Val) -> int:
+        ma, mb = self.mult_of(a), self.mult_of(b)
+        if op in ("+", "-"):
+            return math.gcd(ma, mb)
+        if op == "*":
+            return min(ma * mb, 1 << 30)
+        if op == "<<" and b.is_const:
+            return min(ma << int(b.const), 1 << 30)
+        return 1
 
     def _iop(self, op: str, a: Val, b: Val) -> Val:
         if op in ("+", "-"):
@@ -455,6 +509,15 @@ class KernelCompiler:
         if op == "*" and b.is_const:                      # (base + c) * k = base * k + c * k
             ra, ka = self._split(a)
             return self._offset(self._raw("mul.lo.s32", ra, b), ka * b.const)
+        if op in ("/", "//", "%") and b.is_const and b.const > 0:
+            r = self.range_of(a)
+            if r is not None and r[0] >= 0:               # non-negative: unsigned is cheaper
+                k = int(b.const)
+                if k & (k - 1) == 0:                      # a power of two: a shift or a mask
+                    if op == "%":
+                        return self._raw("and.b32", a, const_int(k - 1))
+                    return self._raw("shr.u32", a, const_int(k.bit_length() - 1))
+                return self._raw("rem.u32" if op == "%" else "div.u32", a, b)
         return self._raw(_INT_INSTR[op], a, b)
 
     def range_of(self, v: Val) -> tuple[int, int] | None:
@@ -622,8 +685,53 @@ class KernelCompiler:
         handler(s)
 
     def body(self, stmts) -> None:
-        for s in stmts:
+        stmts = list(stmts)
+        merged: set[int] = set()
+        for i, s in enumerate(stmts):
+            if i in merged:
+                continue
+            if type(s).__name__ == "Load" and self._hoisted_load(s):
+                continue
+            if type(s).__name__ == "Load" and len(s.names) == 1:
+                j = self._paired_load(stmts, i)
+                if j is not None:
+                    merged.add(j)
+                    continue
             self.stmt(s)
+
+    def _paired_load(self, stmts: list, i: int) -> int | None:
+        """Merge stmts[i], a scalar load of element e, with a later load of element e + 1.
+
+        Two f32 loads of neighbouring elements become one 8-byte `.v2` load when the address
+        is provably 8-byte aligned and nothing in between could change the buffer or the
+        second load's index. Returns the index of the absorbed load, or None.
+        """
+        first = stmts[i]
+        buf = self.buffers.get(first.input)
+        if buf is None or buf.dtype != "f32" or buf.align < 8:
+            return None
+        if any(type(t).__name__ == "Write" and t.output == first.input for t in stmts):
+            return None                                   # the block writes this buffer
+        flat = self.flat_index(buf, first.index)
+        root, k = self._split(flat)
+        if k % 2 or (root is not None and self.mult_of(root) % 2):
+            return None
+        defined: set[str] = set(first.names)
+        stoppers = {"Sync", "CpAsyncCopy", "CpAsyncWait", "Loop", "StridedLoop", "Cond", "TreeHalve", "Smem"}
+        for j in range(i + 1, min(len(stmts), i + 32)):
+            t = stmts[j]
+            kind = type(t).__name__
+            if kind in stoppers:
+                return None
+            if (kind == "Load" and len(t.names) == 1 and t.input == first.input
+                    and not set().union(*(e.free_vars() for e in t.index)) & defined):
+                r2, k2 = self._split(self.flat_index(buf, t.index))
+                if k2 == k + 1 and (r2 is None) == (root is None) and (root is None or r2.text == root.text):
+                    a, b = self.define(first.names[0], "f32"), self.define(t.names[0], "f32")
+                    self.em.emit(f"ld.{buf.space}.v2.f32 {{{a}, {b}}}, {self.address(buf, flat)}")
+                    return j
+            defined.update(_defines(t))
+        return None
 
     # ---- the launch ---------------------------------------------------------------------
     def visit_Tile(self, t) -> None:
@@ -862,13 +970,16 @@ class KernelCompiler:
         trips = None
         if start.is_const and end.is_const and step.is_const and step.const > 0:
             trips = max(0, -(-(end.const - start.const) // step.const))
-        if trips is not None and (trips <= 2 or (unroll and trips <= UNROLL_MAX)):
+        if trips is not None and self._fully_unrolled(trips, body, unroll):
             for k in range(trips):                        # unrolled: the variable is a constant
                 self.env[var] = const_int(start.const + k * step.const)
                 self.body(body)
         elif self._short_loop(var, start, end, step, body):
             pass
         else:
+            hoist = trips is not None and trips >= 1 and not self.lean
+            if hoist:
+                self._hoist_invariant_loads(var, body)
             i = em.reg("s32")
             self.copy_into(i, start)
             factor = self._unroll_factor(body) if step.is_const else 1
@@ -878,10 +989,105 @@ class KernelCompiler:
                 self._rotated_loop(var, i, end, step, body, factor, f"loop_x{factor}")
             if factor == 1 or trips is None or trips % factor:
                 self._rotated_loop(var, i, end, step, body, 1, "loop")
+            if hoist:
+                self.hoisted.pop()
         if saved is None:
             self.env.pop(var, None)
         else:
             self.env[var] = saved
+
+    def _fully_unrolled(self, trips: int, body, unroll: bool) -> bool:
+        """Whether a loop with a known trip count is unrolled completely."""
+        if trips <= 2:
+            return True
+        if self.lean:
+            return False
+        size = trips * self._unrolled_size(body)
+        if unroll and trips <= UNROLL_MAX and size <= FLAGGED_UNROLL_STMTS:
+            return True
+        return self._unroll_factor(body) > 1 and size <= FULL_UNROLL_STMTS
+
+    def _unrolled_size(self, body) -> int:
+        """Statements `body` expands to, counting the copies of inner loops that unroll."""
+        size = 0
+        for t in body:
+            size += 1
+            if type(t).__name__ == "Loop":
+                trips = int(t.axis.extent.as_static())
+                inner = self._unrolled_size(t.body)
+                size += inner * (trips if self._fully_unrolled(trips, t.body, t.unroll) else 1)
+            else:
+                size += sum(self._unrolled_size(sub) for sub in _children(t))
+        return size
+
+    def _hoist_invariant_loads(self, var: str, body) -> None:
+        """Load, in front of a runtime loop, the values its body reads that never change.
+
+        A load is invariant when it reads a global buffer the kernel never writes, at an index
+        built only from names that exist before the loop and from the variables of inner loops
+        that are unrolled completely. Each such load is issued once here, and `visit_Load`
+        then finds its address in `self.hoisted` instead of loading again every iteration.
+        Only for loops known to run at least once, so no load runs that would not have.
+        """
+        inner_defs = {var}.union(*(_defines(t) for t in _walk(body)))
+        found: list[tuple] = []
+
+        def scan(stmts, bound: dict) -> None:
+            for t in stmts:
+                kind = type(t).__name__
+                if kind == "Load":
+                    buf = self.buffers.get(t.input)
+                    free = set().union(*(e.free_vars() for e in t.index)) if t.index else set()
+                    if (buf is not None and buf.space == "global" and buf.dtype == "f32"
+                            and t.input not in self.written and not (free - set(bound)) & inner_defs
+                            and (free - set(bound)) <= set(self.env)):
+                        found.append((t, dict(bound)))
+                elif kind == "Loop":
+                    trips = int(t.axis.extent.as_static())
+                    if self._fully_unrolled(trips, t.body, t.unroll):
+                        for k in range(trips):
+                            scan(t.body, {**bound, t.axis.name: k})
+
+        scan(body, {})
+        table: dict = {}
+        budget = HOIST_MAX
+        for load, bound in found:
+            if budget < len(load.names):
+                break
+            saved = {name: self.env.get(name) for name in bound}
+            self.env.update({name: const_int(k) for name, k in bound.items()})
+            buf = self.buffers[load.input]
+            addr = self.address(buf, self.flat_index(buf, load.index))
+            key = (buf.name, addr, len(load.names))
+            if key not in table:
+                regs = [self.em.reg("f32") for _ in load.names]
+                width = f".v{len(regs)}" if len(regs) in (2, 4) else ""
+                if width or len(regs) == 1:
+                    self.em.emit(f"ld.global{width}.f32 {{{', '.join(map(str, regs))}}}, {addr}"
+                                 if width else f"ld.global.f32 {regs[0]}, {addr}")
+                    table[key] = regs
+                    budget -= len(regs)
+            for name, old in saved.items():
+                if old is None:
+                    self.env.pop(name, None)
+                else:
+                    self.env[name] = old
+        self.hoisted.append(table)
+
+    def _hoisted_load(self, s) -> bool:
+        """If this load was moved in front of an enclosing loop, bind its names and say so."""
+        if not self.hoisted or s.input not in self.buffers:
+            return False
+        buf = self.buffers[s.input]
+        if buf.space != "global":
+            return False
+        addr = self.address(buf, self.flat_index(buf, s.index))
+        for table in reversed(self.hoisted):
+            regs = table.get((buf.name, addr, len(s.names)))
+            if regs is not None:
+                self.env.update(zip(s.names, regs))
+                return True
+        return False
 
     def _short_loop(self, var: str, start: Val, end: Val, step: Val, body) -> bool:
         """Unroll a loop whose trip count depends on the thread but is known to be small.
@@ -936,6 +1142,9 @@ class KernelCompiler:
                 em.emit(f"@{p} bra {target}")
 
         test("ge", done)
+        lo = self.range_of(i)
+        if lo is not None and end.is_const:               # inside the body, start <= i < end
+            self.ranges[i.text] = (lo[0], end.const - 1)
         em.place(top)
         if factor == 1:
             em.emit('.pragma "nounroll"')                 # remainder loops stay small
@@ -957,7 +1166,7 @@ class KernelCompiler:
         """
         stmts = list(_walk(body))
         blocked = {"Sync", "CpAsyncCopy", "CpAsyncCommit", "CpAsyncWait", "WarpShuffle", "TreeHalve", "Smem"}
-        if len(stmts) > UNROLL_BODY_MAX or any(type(s).__name__ in blocked for s in stmts):
+        if self.lean or len(stmts) > UNROLL_BODY_MAX or any(type(s).__name__ in blocked for s in stmts):
             return 1
         loads = sum(type(s).__name__ == "Load" for s in stmts)
         factor = 2
@@ -1046,4 +1255,8 @@ class KernelCompiler:
 
 
 def compile_kernel(graph, kernel, launch: dict, target: str = "sm_89") -> str:
-    return KernelCompiler(graph, kernel, launch, target).compile()
+    """Compile with all optimizations, falling back to the lean mode if the PTX grows too big."""
+    ptx = KernelCompiler(graph, kernel, launch, target).compile()
+    if len(ptx) > PTX_SIZE_LIMIT:
+        ptx = KernelCompiler(graph, kernel, launch, target, lean=True).compile()
+    return ptx
