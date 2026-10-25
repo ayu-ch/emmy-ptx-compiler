@@ -115,10 +115,6 @@ class Emitter:
         return [line.text if isinstance(line, _Lazy) else line
                 for line in self.lines if not isinstance(line, _Lazy) or line.dst in used]
 
-    def comment(self, text: str) -> None:
-        # PTX rejects non-ASCII anywhere, comments included.
-        self.lines.append(f"    // {text.encode('ascii', 'replace').decode()}")
-
     def label(self, hint: str) -> str:
         self.n_labels += 1
         return f"$L{self.n_labels}_{hint}"
