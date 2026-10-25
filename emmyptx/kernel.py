@@ -27,7 +27,8 @@ from .ptx import Emitter, Val, const_f32, const_int, const_pred
 # Element types of buffers: bytes per element and the PTX type used to load/store them.
 ELEM = {"f32": (4, "f32"), "f16": (2, "b16"), "i32": (4, "s32")}
 SMEM_DTYPE = {"float": "f32", "__half": "f16", "half": "f16", "int": "i32"}
-INT_DTYPES = {"int", "i32", "i64", "int32", "int64", "u32", "u8", "i8", "bool"}
+INT_DTYPES = {"int", "i32", "i64", "int32", "int64", "u32", "u8", "i8"}
+# `bool` values (comparison results) are kept as 1.0 / 0.0 floats, Emmy's mask convention.
 
 # Loops the IR marks `unroll` are unrolled at compile time up to this trip count, which turns
 # their index arithmetic into constants (e.g. matmul's shared-memory reads become [reg+imm]).
