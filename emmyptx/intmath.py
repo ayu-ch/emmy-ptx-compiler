@@ -55,6 +55,7 @@ class IntMath:
         self.affine: dict[str, tuple[Val, int]] = {}    # register -> (base register, constant)
         self.ranges: dict[str, tuple[int, int]] = {}    # register -> (lo, hi)
         self.mults: dict[str, int] = {}                 # register -> known divisor
+        self.sums: dict[str, tuple[Val, Val]] = {}      # register -> (x, y) when it is x + y
 
     # ---- the entry point ----------------------------------------------------------------
     def iop(self, op: str, a: Val, b: Val) -> Val:
@@ -93,7 +94,14 @@ class IntMath:
                 return self._offset(rb, ka + kb)
             if ra is None:                                # constant - x
                 return self._offset(self.raw("sub.s32", const_int(0), rb), ka - kb)
-            return self._offset(self.raw(INT_INSTR[op], ra, rb), ka + sign * kb)
+            if op == "-" and ra.text in self.sums:        # (x + y) - x = y
+                x, y = self.sums[ra.text]
+                if rb.text in (x.text, y.text):
+                    return self._offset(y if rb.text == x.text else x, ka - kb)
+            r = self.raw(INT_INSTR[op], ra, rb)
+            if op == "+":
+                self.sums[r.text] = (ra, rb)
+            return self._offset(r, ka + sign * kb)
         if op == "*" and b.is_const:                      # (base + c) * k = base * k + c * k
             ra, ka = self.split(a)
             return self._offset(self.raw("mul.lo.s32", ra, b), ka * b.const)
@@ -160,6 +168,8 @@ class IntMath:
                 del table[key]
         for key in [k for k, (base, _) in self.affine.items() if k == reg.text or base.text == reg.text]:
             del self.affine[key]
+        for key in [k for k, (x, y) in self.sums.items() if reg.text in (k, x.text, y.text)]:
+            del self.sums[key]
 
     @contextmanager
     def block(self):
