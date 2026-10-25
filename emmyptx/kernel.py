@@ -438,22 +438,29 @@ class KernelCompiler(IntMath, LoopLowering):
         handler(s)
 
     def body(self, stmts) -> None:
-        """A statement list. Loads get two chances first: to reuse a value hoisted out of an
-        enclosing loop, and to merge with a later load of the next element."""
+        """Compile a statement list, in order."""
         stmts = list(stmts)
         absorbed: set[int] = set()
-        for i, s in enumerate(stmts):
-            if i in absorbed:
-                continue
-            if type(s).__name__ == "Load":
-                if self.hoisted_load(s):
-                    continue
-                if len(s.names) == 1 and self.level > 0:
-                    j = self._paired_load(stmts, i)
-                    if j is not None:
-                        absorbed.add(j)
-                        continue
-            self.stmt(s)
+        for i in range(len(stmts)):
+            if i not in absorbed:
+                absorbed |= self.statement_in(stmts, i)
+
+    def statement_in(self, stmts: list, i: int) -> set[int]:
+        """Compile stmts[i]; return the indices of later statements it took care of too.
+
+        Loads get two chances before the plain lowering: to reuse a value hoisted out of an
+        enclosing loop, and to merge with a later load of the next element.
+        """
+        s = stmts[i]
+        if type(s).__name__ == "Load":
+            if self.hoisted_load(s):
+                return set()
+            if len(s.names) == 1 and self.level > 0:
+                j = self._paired_load(stmts, i)
+                if j is not None:
+                    return {j}
+        self.stmt(s)
+        return set()
 
     def _paired_load(self, stmts: list, i: int) -> int | None:
         """Merge stmts[i], a scalar load of element e, with a later load of element e + 1.

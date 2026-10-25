@@ -111,6 +111,9 @@ python tools/run_all.py ../emmy-hackathon-2026 out/extra
 # the same checks on a local NVIDIA GPU, no network: same input generation, same tolerances
 python tools/run_local.py ../emmy-hackathon-2026/problems
 
+# the PTX of one kernel, with each IR statement as a comment above the code it produced
+python tools/trace.py ../emmy-hackathon-2026/problems/r01_array_sum/k_sum_1_reduce.ir.json
+
 # regenerate the generalization set (needs torch) with the organizers' generator
 python ../emmy-hackathon-2026/tools/generate.py --emmy "$(which emmy)" --out out/extra tools/expressions_extra.py
 ```
