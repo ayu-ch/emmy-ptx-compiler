@@ -159,3 +159,11 @@ OPEN += [
     dict(id="x19_batched_matmul", code="torch.randn(4, 64, 32) @ torch.randn(4, 32, 48)",
          ref=lambda a, b: _f32(f64(a) @ f64(b)), rtol=1e-3, atol=1e-3),
 ]
+
+# ---- f16 buffers (computed in f32, rounded on store) ----------------------------------------
+OPEN += [
+    dict(id="h00_half_add", code="torch.randn(1024, dtype=torch.float16) + torch.randn(1024, dtype=torch.float16)",
+         ref=lambda a, b: [(a.astype(np.float32) + b.astype(np.float32)).astype(np.float16)], rtol=1e-3, atol=1e-3),
+    dict(id="h01_half_rowsum", code="torch.randn(64, 256, dtype=torch.float16).sum(-1)",
+         ref=lambda x: [x.astype(np.float64).sum(-1).astype(np.float16)], rtol=1e-2, atol=1e-2, knobs=REDUCE_KNOBS),
+]

@@ -410,8 +410,13 @@ class KernelCompiler(IntMath, LoopLowering):
             reg = self._cse_get(key)
             if reg is None:
                 if buf.space == "global":
-                    wide, reg = em.reg("u64"), em.reg("u64")
-                    em.emit(f"mul.wide.s32 {wide}, {root}, {buf.esize}")
+                    wide_key = ("wide", root.text, buf.esize)     # the byte offset, shared by
+                    wide = self._cse_get(wide_key)                # every buffer indexed by root
+                    if wide is None:
+                        wide = em.reg("u64")
+                        em.emit(f"mul.wide.s32 {wide}, {root}, {buf.esize}")
+                        self.remember(wide_key, wide)
+                    reg = em.reg("u64")
                     em.emit(f"add.s64 {reg}, {buf.base}, {wide}")
                 else:
                     reg = em.reg("s32")
