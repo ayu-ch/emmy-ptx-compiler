@@ -33,6 +33,13 @@ INT_DTYPES = {"int", "i32", "i64", "int32", "int64", "u32", "u8", "i8"}
 # Loops the IR marks `unroll` are unrolled at compile time up to this trip count, which turns
 # their index arithmetic into constants (e.g. matmul's shared-memory reads become [reg+imm]).
 UNROLL_MAX = 128
+# Runtime loops over plain computation (bodies up to UNROLL_BODY_MAX statements) are unrolled
+# so that one trip issues about LOADS_IN_FLIGHT independent loads: with few threads per SM,
+# memory-level parallelism inside each thread is what hides DRAM latency.
+LOADS_IN_FLIGHT = 16
+UNROLL_BODY_MAX = 40
+# A loop whose trip count is only known to lie in a range is fully unrolled up to this many copies.
+SHORT_LOOP_MAX = 16
 
 # Shared-memory XOR swizzles: mode -> (element shift, row mask), as in Emmy's slab layouts.
 SWIZZLE_XOR = {"B128": (6, 0x7), "B64": (6, 0x3), "B32": (6, 0x1)}
@@ -116,6 +123,24 @@ class KernelCompiler:
         self.smem_for: dict[int, Buffer] = {}      # id(Smem stmt) -> its buffer
         self.guarded = False                       # some launched threads exit early
         self.exit_label = "$L_exit"
+        # Integer common-subexpression cache, one dict per open block: a value computed in a
+        # loop body or a branch is forgotten when that block closes, so it is never reused
+        # where it was not computed.
+        self.cse: list[dict] = [{}]
+        # Registers known to equal `base + constant` (register text -> (base, constant)), so
+        # addresses can fold the constant into the `[reg+imm]` operand.
+        self.affine: dict[str, tuple[Val, int]] = {}
+        # Known value ranges of integer registers (register text -> (lo, hi)), from the tile
+        # decode onward. They let a loop whose start depends on the thread still know its trip count.
+        self.ranges: dict[str, tuple[int, int]] = {}
+        # Names whose value is carried across iterations or combine steps: they keep one register.
+        self.carried: set[str] = set()
+        for s in _walk(kernel.body):
+            kind = type(s).__name__
+            if kind in ("Accum", "Init"):
+                self.carried.add(s.name)
+            elif kind in ("WarpShuffle", "TreeHalve"):
+                self.carried.update(s.state)
         # Every tensor the graph knows: name -> (shape, dtype). Scalars count as one element.
         self.tensors = {}
         for node in graph.nodes.values():
@@ -185,6 +210,10 @@ class KernelCompiler:
         lane, warp = em.reg("s32"), em.reg("s32")
         em.emit(f"and.b32 {lane}, {tid}, 31")
         em.emit(f"shr.u32 {warp}, {tid}, 5")
+        block = math.prod(self.launch.get("block", [1024]))
+        self.ranges[tid.text] = (0, block - 1)
+        self.ranges[lane.text] = (0, min(block, 32) - 1)
+        self.ranges[warp.text] = (0, (block - 1) // 32)
         self.tid = tid
         self.env["lane"], self.env["warp"] = lane, warp
         return params
@@ -238,9 +267,16 @@ class KernelCompiler:
         return self.env[name]
 
     def define(self, name: str, ty: str) -> Val:
-        """The register that holds `name`: its existing one when it has one, else a new one."""
+        """The register a new value of `name` is written to.
+
+        Carried names (accumulators, `Init` state, shuffle / tree states) keep one register
+        that is updated in place, since their value flows across loop iterations and combine
+        steps. Every other definition gets a fresh register: plain SSA form, so independent
+        values (e.g. the loads of an unrolled loop) never share a register, and an integer
+        register never changes after it is written, which the CSE cache relies on.
+        """
         old = self.env.get(name)
-        if old is not None and not old.is_const and old.ty == ty:
+        if name in self.carried and old is not None and not old.is_const and old.ty == ty:
             return old
         r = self.em.reg(ty)
         self.env[name] = r
@@ -284,6 +320,8 @@ class KernelCompiler:
         return p
 
     def copy_into(self, dst: Val, v: Val) -> None:
+        if dst.ty == "s32":
+            self._forget(dst)
         if dst.text != v.text:
             self.em.emit(f"mov.{'b32' if dst.ty == 's32' else dst.ty} {dst}, {v}")
 
@@ -375,7 +413,13 @@ class KernelCompiler:
         return self.iop(op, a, b)
 
     def iop(self, op: str, a: Val, b: Val) -> Val:
-        """Integer arithmetic with constant folding and the obvious identities."""
+        """Integer arithmetic: constant folding, identities, affine splitting and CSE.
+
+        `+`, `-` and `* constant` keep track of each result as `base + constant` (see
+        `self.affine`), so `(i + 3) * 64 + c` is recorded as `(i * 64 + c) + 192`. The
+        register holding the full value is still emitted (ptxas drops it when unused), but
+        `address()` can address `base` with an immediate offset of 192 elements.
+        """
         if op not in _INT_INSTR:
             raise CompileError(f"integer operator {op!r} is not supported")
         if a.is_const and b.is_const:
@@ -390,9 +434,114 @@ class KernelCompiler:
                 return const_int(0)
             if op == "%" and k == 1:
                 return const_int(0)
-        r = self.em.reg("s32")
-        self.em.emit(f"{_INT_INSTR[op]} {r}, {self.em.materialize(a)}, {b}")
+        result = self._iop(op, a, b)
+        if not result.is_const and result.text not in self.ranges:
+            r = self._range_after(op, self.range_of(a), self.range_of(b))
+            if r is not None:
+                self.ranges[result.text] = r
+        return result
+
+    def _iop(self, op: str, a: Val, b: Val) -> Val:
+        if op in ("+", "-"):
+            (ra, ka), (rb, kb) = self._split(a), self._split(b)
+            sign = 1 if op == "+" else -1
+            if rb is None:                                # x +/- constant
+                return self._offset(ra, ka + sign * kb)
+            if ra is None and op == "+":
+                return self._offset(rb, ka + kb)
+            if ra is None:                                # constant - x
+                return self._offset(self._raw("sub.s32", const_int(0), rb), ka - kb)
+            return self._offset(self._raw(_INT_INSTR[op], ra, rb), ka + sign * kb)
+        if op == "*" and b.is_const:                      # (base + c) * k = base * k + c * k
+            ra, ka = self._split(a)
+            return self._offset(self._raw("mul.lo.s32", ra, b), ka * b.const)
+        return self._raw(_INT_INSTR[op], a, b)
+
+    def range_of(self, v: Val) -> tuple[int, int] | None:
+        """The known (lo, hi) of an integer value, or None."""
+        if v.is_const:
+            return int(v.const), int(v.const)
+        if v.text in self.ranges:
+            return self.ranges[v.text]
+        if v.text in self.affine:
+            base, k = self.affine[v.text]
+            r = self.range_of(base)
+            return (r[0] + k, r[1] + k) if r else None
+        return None
+
+    @staticmethod
+    def _range_after(op: str, ra, rb) -> tuple[int, int] | None:
+        """Interval arithmetic for the integer operators whose result range is easy to bound."""
+        if ra is None or rb is None:
+            return None
+        if op == "+":
+            return ra[0] + rb[0], ra[1] + rb[1]
+        if op == "-":
+            return ra[0] - rb[1], ra[1] - rb[0]
+        if op == "*":
+            corners = [x * y for x in ra for y in rb]
+            return min(corners), max(corners)
+        if op in ("/", "//") and rb[0] == rb[1] and rb[0] > 0 and ra[0] >= 0:
+            return ra[0] // rb[0], ra[1] // rb[0]
+        if op == "%" and rb[0] == rb[1] and rb[0] > 0 and ra[0] >= 0:
+            return (ra[0], ra[1]) if ra[1] < rb[0] else (0, rb[0] - 1)
+        if op in ("max", "min"):
+            f = max if op == "max" else min
+            return f(ra[0], rb[0]), f(ra[1], rb[1])
+        return None
+
+    def _split(self, v: Val) -> tuple[Val | None, int]:
+        """`v` as (register base, constant offset); a constant is (None, value)."""
+        if v.is_const:
+            return None, int(v.const)
+        return self.affine.get(v.text, (v, 0))
+
+    def _offset(self, base: Val, k: int) -> Val:
+        """The register `base + k`, remembered as affine so addresses can split it again."""
+        if k == 0:
+            return base
+        r = self._raw("add.s32", base, const_int(k))
+        self.affine[r.text] = (base, k)
         return r
+
+    def _raw(self, instr: str, a: Val, b: Val) -> Val:
+        """Emit one integer instruction, or reuse the register of an identical earlier one."""
+        a = self.em.materialize(a)
+        key = (instr, a.text, b.text)
+        hit = self._cse_get(key)
+        if hit is not None:
+            return hit
+        r = self.em.reg("s32")
+        self.em.emit(f"{instr} {r}, {a}, {b}")
+        self.cse[-1][key] = r
+        return r
+
+    def _cse_get(self, key):
+        for table in reversed(self.cse):
+            if key in table:
+                return table[key]
+        return None
+
+    def _forget(self, reg: Val) -> None:
+        """`reg` is about to change: drop every cached result and affine fact that read it."""
+        for table in self.cse:
+            for key in [k for k, v in table.items() if reg.text in k[1:] or v.text == reg.text]:
+                del table[key]
+        for key in [k for k, (base, _) in self.affine.items() if k == reg.text or base.text == reg.text]:
+            del self.affine[key]
+
+    def block(self):
+        """Context manager for a block of code that may not run (a loop body or a branch)."""
+        compiler = self
+
+        class _Block:
+            def __enter__(self):
+                compiler.cse.append({})
+
+            def __exit__(self, *exc):
+                compiler.cse.pop()
+
+        return _Block()
 
     def select(self, p: Val, t: Val, f: Val) -> Val:
         """`p ? t : f` with both sides brought to one type."""
@@ -441,18 +590,23 @@ class KernelCompiler:
     def address(self, buf: Buffer, flat: Val, extra: int = 0) -> str:
         """The PTX address operand of element `flat + extra` of `buf`, e.g. `[%rd7+8]`."""
         em = self.em
-        if flat.is_const:
-            reg, off = buf.base, (flat.const + extra) * buf.esize
-        elif buf.space == "global":
-            wide, addr = em.reg("u64"), em.reg("u64")
-            em.emit(f"mul.wide.s32 {wide}, {flat}, {buf.esize}")
-            em.emit(f"add.s64 {addr}, {buf.base}, {wide}")
-            reg, off = addr, extra * buf.esize
+        root, k = self._split(flat)                       # flat = root + k elements
+        off = (k + extra) * buf.esize
+        if root is None:
+            reg = buf.base
         else:
-            addr = em.reg("s32")
-            em.emit(f"mad.lo.s32 {addr}, {flat}, {buf.esize}, {buf.base}")
-            reg, off = addr, extra * buf.esize
-        if off < 0:                                       # PTX offsets are added, not subtracted
+            key = ("addr", buf.name, root.text)
+            reg = self._cse_get(key)
+            if reg is None:
+                if buf.space == "global":
+                    wide, reg = em.reg("u64"), em.reg("u64")
+                    em.emit(f"mul.wide.s32 {wide}, {root}, {buf.esize}")
+                    em.emit(f"add.s64 {reg}, {buf.base}, {wide}")
+                else:
+                    reg = em.reg("s32")
+                    em.emit(f"mad.lo.s32 {reg}, {root}, {buf.esize}, {buf.base}")
+                self.cse[-1][key] = reg
+        if off < 0:                                       # keep the immediate offset non-negative
             r = em.reg(reg.ty)
             em.emit(f"add.{'s64' if reg.ty == 'u64' else 's32'} {r}, {reg}, {off}")
             reg, off = r, 0
@@ -500,7 +654,12 @@ class KernelCompiler:
             p = em.reg("pred")
             em.emit(f"setp.ge.s32 {p}, {gid}, {n}")
             em.emit(f"@{p} bra {self.exit_label}")
+        self.ranges[gid.text] = (0, n - 1)                # past the guard, or launched exactly
         self._decode_axes(t, extents, gid)
+        for a, e in zip(t.axes, extents):
+            v = self.env[a.name]
+            if not v.is_const:
+                self.ranges[v.text] = (0, e - 1)
         self.body(t.body)
 
     def _decode_axes(self, t, extents: list[int], gid: Val) -> None:
@@ -690,32 +849,121 @@ class KernelCompiler:
         self._loop(s.axis.name, start, end, step, s.body, s.unroll)
 
     def _loop(self, var: str, start: Val, end: Val, step: Val, body, unroll: bool) -> None:
+        """Emit `for (var = start; var < end; var += step) body`.
+
+        - A loop with a known trip count is unrolled completely when the IR asks for it (or
+          when it runs at most twice): the variable becomes a constant in every copy.
+        - Otherwise it is a runtime loop. When the body is plain computation, it is unrolled
+          so that each trip of the main loop issues about LOADS_IN_FLIGHT loads at once, and
+          a remainder loop finishes the last few iterations.
+        """
         em = self.em
         saved = self.env.get(var)
         trips = None
         if start.is_const and end.is_const and step.is_const and step.const > 0:
             trips = max(0, -(-(end.const - start.const) // step.const))
-        if trips is not None and (trips <= 1 or (unroll and trips <= UNROLL_MAX)):
+        if trips is not None and (trips <= 2 or (unroll and trips <= UNROLL_MAX)):
             for k in range(trips):                        # unrolled: the variable is a constant
                 self.env[var] = const_int(start.const + k * step.const)
                 self.body(body)
+        elif self._short_loop(var, start, end, step, body):
+            pass
         else:
             i = em.reg("s32")
             self.copy_into(i, start)
-            top, done = em.label("loop"), em.label("done")
-            em.place(top)
-            p = em.reg("pred")
-            em.emit(f"setp.ge.s32 {p}, {i}, {end}")
-            em.emit(f"@{p} bra {done}")
-            self.env[var] = i
-            self.body(body)
-            em.emit(f"add.s32 {i}, {i}, {step}")
-            em.emit(f"bra {top}")
-            em.place(done)
+            factor = self._unroll_factor(body) if step.is_const else 1
+            if trips is not None and trips < 2 * factor:
+                factor = 1
+            if factor > 1:
+                self._rotated_loop(var, i, end, step, body, factor, f"loop_x{factor}")
+            if factor == 1 or trips is None or trips % factor:
+                self._rotated_loop(var, i, end, step, body, 1, "loop")
         if saved is None:
             self.env.pop(var, None)
         else:
             self.env[var] = saved
+
+    def _short_loop(self, var: str, start: Val, end: Val, step: Val, body) -> bool:
+        """Unroll a loop whose trip count depends on the thread but is known to be small.
+
+        A cooperative loop `for i in tid..N:step` runs between tmin and tmax times, from the
+        range of `tid`. The first tmin copies run unconditionally; each later copy first
+        checks `i < end` and jumps past the rest when it fails. Returns False when the loop
+        is not of this kind.
+        """
+        if not (step.is_const and step.const > 0 and end.is_const) or self._unroll_factor(body) == 1:
+            return False
+        r = self.range_of(start)
+        if r is None:
+            return False
+        tmax = max(0, -(-(end.const - r[0]) // step.const))
+        tmin = max(0, -(-(end.const - r[1]) // step.const))
+        if tmax > SHORT_LOOP_MAX:
+            return False
+        em = self.em
+        done = em.label("short_end")
+        with self.block():
+            for k in range(tmax):
+                v = self.iop("+", start, const_int(k * step.const))
+                if k >= tmin:
+                    p = em.reg("pred")
+                    em.emit(f"setp.ge.s32 {p}, {v}, {end}")
+                    em.emit(f"@{p} bra {done}")
+                self.env[var] = v
+                self.body(body)
+        em.place(done)
+        return True
+
+    def _rotated_loop(self, var: str, i: Val, end: Val, step: Val, body, factor: int, name: str) -> None:
+        """Run `body` `factor` times per trip while i + (factor-1)*step < end, testing at the bottom.
+
+            @(i + (factor-1)*step >= end) bra done      // enter only if a full trip fits
+          top:
+            body(i), body(i + step), ...                // `factor` copies
+            i += factor * step
+            @(i + (factor-1)*step < end) bra top        // one branch per trip
+          done:
+        """
+        em = self.em
+        reach = (factor - 1) * step.const if factor > 1 else 0
+        top, done = em.label(name), em.label(name + "_end")
+
+        def test(cmp: str, target: str) -> None:
+            with self.block():
+                last = self.iop("+", i, const_int(reach))
+                p = em.reg("pred")
+                em.emit(f"setp.{cmp}.s32 {p}, {last}, {end}")
+                em.emit(f"@{p} bra {target}")
+
+        test("ge", done)
+        em.place(top)
+        if factor == 1:
+            em.emit('.pragma "nounroll"')                 # remainder loops stay small
+        with self.block():
+            for k in range(factor):
+                self.env[var] = self.iop("+", i, const_int(k * step.const)) if factor > 1 else i
+                self.body(body)
+        self._forget(i)
+        em.emit(f"add.s32 {i}, {i}, {factor * step.const if factor > 1 else step}")
+        test("lt", top)
+        em.place(done)
+
+    def _unroll_factor(self, body) -> int:
+        """How many copies of a runtime loop's body one trip runs (1 = no unrolling).
+
+        Only plain computation of modest size is unrolled: no barriers, async copies or
+        cross-thread combines. The factor is the power of two that brings the loads per trip
+        to about LOADS_IN_FLIGHT.
+        """
+        stmts = list(_walk(body))
+        blocked = {"Sync", "CpAsyncCopy", "CpAsyncCommit", "CpAsyncWait", "WarpShuffle", "TreeHalve", "Smem"}
+        if len(stmts) > UNROLL_BODY_MAX or any(type(s).__name__ in blocked for s in stmts):
+            return 1
+        loads = sum(type(s).__name__ == "Load" for s in stmts)
+        factor = 2
+        while factor * 2 * max(loads, 1) <= LOADS_IN_FLIGHT:
+            factor *= 2
+        return factor
 
     def visit_Cond(self, s) -> None:
         em = self.em
@@ -725,11 +973,13 @@ class KernelCompiler:
             return
         else_label, end_label = em.label("else"), em.label("endif")
         em.emit(f"@!{p} bra {else_label if s.else_body else end_label}")
-        self.body(s.body)
+        with self.block():
+            self.body(s.body)
         if s.else_body:
             em.emit(f"bra {end_label}")
             em.place(else_label)
-            self.body(s.else_body)
+            with self.block():
+                self.body(s.else_body)
         em.place(end_label)
 
     # ---- cross-thread combines ----------------------------------------------------------
@@ -780,13 +1030,14 @@ class KernelCompiler:
             p = em.reg("pred")
             em.emit(f"setp.ge.s32 {p}, {em.materialize(t)}, {half}")
             em.emit(f"@{p} bra {skip}")
-            other = slot_of(half)
-            for buf, st, sb in zip(bufs, s.state, s.state_b):
-                em.emit(f"ld.shared.f32 {self.define(st, 'f32')}, {self.address(buf, slot)}")
-                em.emit(f"ld.shared.f32 {self.define(sb, 'f32')}, {self.address(buf, other)}")
-            self.body(s.combine_states)
-            for buf, st in zip(bufs, s.state):
-                em.emit(f"st.shared.f32 {self.address(buf, slot)}, {em.materialize(self.lookup(st))}")
+            with self.block():                            # only threads t < half run this
+                other = slot_of(half)
+                for buf, st, sb in zip(bufs, s.state, s.state_b):
+                    em.emit(f"ld.shared.f32 {self.define(st, 'f32')}, {self.address(buf, slot)}")
+                    em.emit(f"ld.shared.f32 {self.define(sb, 'f32')}, {self.address(buf, other)}")
+                self.body(s.combine_states)
+                for buf, st in zip(bufs, s.state):
+                    em.emit(f"st.shared.f32 {self.address(buf, slot)}, {em.materialize(self.lookup(st))}")
             em.place(skip)
             em.emit(barrier)                              # reached by every thread, worker or not
             half //= 2
