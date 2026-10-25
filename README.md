@@ -20,7 +20,7 @@ Emmy's renderer, `emmy compile`, `nvcc` or any other compiler.
 |---|---|
 | Open problem set | **15 / 15** pass on the runner (RTX 5090, sm_120) and on an RTX 3060 (sm_86) |
 | Generalization set | **51 / 51** pass on both GPUs: [`tools/expressions_extra.py`](tools/expressions_extra.py), the five categories with other shapes and ops (GELU, SiLU, tanh, layer norm, column sums, batched / chained / fused matmuls, attention up to 512 keys, f16 buffers) |
-| Kernel speed | on the open set, level with `nvcc` compiling Emmy's own CUDA for the same IR (geometric mean 0.99×, range 0.78× to 1.24×) |
+| Kernel speed | level with `nvcc` compiling Emmy's own CUDA for the same IR: geometric mean 0.99× on the open set (0.78× to 1.24×) and 1.04× on the generalization set (0.50× to 3.48×) |
 
 Speed was measured on the runner (10 warm-up and 50 timed launches, median), against PTX that
 `nvcc -O3` produced from each problem's `.ref.cu`, purely as a benchmark:
