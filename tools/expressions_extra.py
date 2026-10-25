@@ -131,3 +131,31 @@ OPEN = [
                                  "torch.softmax(q @ kt * 0.125, dim=-1) @ v",
          ref=lambda q, kt, v: _f32(_softmax(f64(q) @ f64(kt) * 0.125) @ f64(v)), rtol=1e-3, atol=1e-4),
 ]
+
+# ---- multi-kernel problems and large shapes ------------------------------------------------
+OPEN += [
+    dict(id="x10_chain_matmul", code="a = torch.randn(64, 96); b = torch.randn(96, 80); c = torch.randn(80, 48); a @ b @ c",
+         ref=lambda a, b, c: _f32(f64(a) @ f64(b) @ f64(c)), rtol=1e-3, atol=1e-3),
+    dict(id="x11_matmul_softmax", code="torch.softmax(torch.randn(128, 64) @ torch.randn(64, 256), dim=-1)",
+         ref=lambda a, b: _f32(_softmax(f64(a) @ f64(b))), rtol=1e-3, atol=1e-5),
+    dict(id="x12_matmul_rowsum", code="(torch.randn(256, 128) @ torch.randn(128, 64)).sum(-1)",
+         ref=lambda a, b: _f32((f64(a) @ f64(b)).sum(-1)), rtol=1e-3, atol=1e-3),
+    dict(id="x13_big_sum_default", code="torch.randn(1 << 20).sum()",
+         ref=lambda x: _f32(f64(x).sum()), rtol=1e-3, atol=1e-2),
+    dict(id="x14_matmul_2048", code="torch.randn(2048, 512) @ torch.randn(512, 1024)",
+         ref=lambda a, b: _f32(f64(a) @ f64(b)), rtol=1e-3, atol=1e-3),
+    dict(id="x15_softmax_4096", code="torch.softmax(torch.randn(16, 4096), dim=-1)",
+         ref=lambda x: _f32(_softmax(f64(x))), rtol=1e-3, atol=1e-6),
+    dict(id="x16_attn_512", code="q = torch.randn(512, 64); kt = torch.randn(64, 512); v = torch.randn(512, 64); "
+                                 "torch.softmax(q @ kt * 0.125, dim=-1) @ v",
+         ref=lambda q, kt, v: _f32(_softmax(f64(q) @ f64(kt) * 0.125) @ f64(v)), rtol=1e-3, atol=1e-4),
+    dict(id="x17_norm_then_matmul",
+         code="x = torch.randn(64, 256); w = torch.randn(256, 128); "
+              "(x / torch.sqrt((x * x).mean(-1, keepdim=True) + 1e-6)) @ w",
+         ref=lambda x, w: _f32((f64(x) / np.sqrt((f64(x) ** 2).mean(-1, keepdims=True) + 1e-6)) @ f64(w)),
+         rtol=1e-3, atol=1e-3),
+    dict(id="x18_mean_cols_default", code="torch.randn(4096, 32).mean(0)",
+         ref=lambda x: _f32(f64(x).mean(0)), rtol=1e-4, atol=1e-4),
+    dict(id="x19_batched_matmul", code="torch.randn(4, 64, 32) @ torch.randn(4, 32, 48)",
+         ref=lambda a, b: _f32(f64(a) @ f64(b)), rtol=1e-3, atol=1e-3),
+]

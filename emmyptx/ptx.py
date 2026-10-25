@@ -11,6 +11,7 @@ does the real register allocation.
 
 from __future__ import annotations
 
+import re
 import struct
 from dataclasses import dataclass
 
@@ -62,6 +63,15 @@ def const_pred(v: bool) -> Val:
     return Val("1" if v else "0", "pred", bool(v))
 
 
+_REGISTER = re.compile(r"%[a-z]+\d+")
+
+
+@dataclass
+class _Lazy:
+    dst: str
+    text: str
+
+
 class Emitter:
     """Collects the kernel body's instructions and hands out registers and labels."""
 
@@ -77,6 +87,33 @@ class Emitter:
 
     def emit(self, instr: str) -> None:
         self.lines.append(f"    {instr};")
+
+    def emit_lazy(self, dst: Val, instr: str) -> None:
+        """An instruction that is kept only if some other instruction reads its result `dst`.
+
+        The compiler computes some values speculatively (e.g. the full value of an index whose
+        uses may all fold into address offsets, or a product that may become part of an FMA).
+        Dropping the unused ones here keeps the PTX small; ptxas would delete them anyway.
+        """
+        self.lines.append(_Lazy(dst.text, f"    {instr};"))
+
+    def render(self) -> list[str]:
+        """The body lines, without the lazy instructions nobody reads."""
+        used: set[str] = set()
+        for line in self.lines:
+            if isinstance(line, str):
+                used.update(_REGISTER.findall(line))
+        changed = True
+        while changed:                                    # a kept lazy line may read another one
+            changed = False
+            for line in self.lines:
+                if isinstance(line, _Lazy) and line.dst in used:
+                    new = set(_REGISTER.findall(line.text.split(",", 1)[1])) - used
+                    if new:
+                        used |= new
+                        changed = True
+        return [line.text if isinstance(line, _Lazy) else line
+                for line in self.lines if not isinstance(line, _Lazy) or line.dst in used]
 
     def comment(self, text: str) -> None:
         # PTX rejects non-ASCII anywhere, comments included.
