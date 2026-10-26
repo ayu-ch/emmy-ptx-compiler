@@ -163,8 +163,8 @@ class IntMath:
 
     def forget(self, reg: Val) -> None:
         """`reg` is about to change: drop every cached result and affine fact that read it."""
-        for table in self.cse:
-            for key in [k for k, v in table.items() if reg.text in k[1:] or v.text == reg.text]:
+        for table in self.cse:                            # (over-forgetting is safe)
+            for key in [k for k, v in table.items() if reg.text in repr((k, v))]:
                 del table[key]
         for key in [k for k, (base, _) in self.affine.items() if k == reg.text or base.text == reg.text]:
             del self.affine[key]

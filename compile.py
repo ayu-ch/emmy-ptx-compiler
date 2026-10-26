@@ -15,7 +15,7 @@ from pathlib import Path
 from emmy.compiler.graph import Graph
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from emmyptx.kernel import compile_kernel  # noqa: E402
+from emmyptx.kernel import KernelCompiler, compile_kernel  # noqa: E402
 
 
 def find_launch(meta: dict | None, kernel, graph) -> dict:
@@ -35,6 +35,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("ir", help="a Kernel IR json file (<kernel>.ir.json)")
     ap.add_argument("--target", default="sm_89", help="PTX target architecture (default: sm_89)")
+    ap.add_argument("--level", type=int, choices=(0, 1, 2),
+                    help="force one optimization level (default: the highest that works and fits)")
     args = ap.parse_args()
 
     ir_path = Path(args.ir)
@@ -47,7 +49,11 @@ def main() -> int:
     meta = json.loads(meta_path.read_text()) if meta_path.exists() else None
     launch = find_launch(meta, kernel, graph)
 
-    sys.stdout.write(compile_kernel(graph, kernel, launch, target=args.target))
+    if args.level is None:
+        ptx = compile_kernel(graph, kernel, launch, target=args.target)
+    else:
+        ptx = KernelCompiler(graph, kernel, launch, args.target, level=args.level).compile()
+    sys.stdout.write(ptx)
     return 0
 
 

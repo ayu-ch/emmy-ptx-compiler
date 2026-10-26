@@ -99,14 +99,16 @@ def run_kernel(ptx: str, k: dict, produced: dict) -> dict:
     return outputs
 
 
-def run_problem(pdir: Path, target: str) -> tuple[bool, str]:
+def run_problem(pdir: Path, target: str, level: int | None = None) -> tuple[bool, str]:
     meta = json.loads((pdir / "meta.json").read_text())
     expected = dict(np.load(pdir / "expected.npz"))
     produced, report = {}, []
     for k in meta["kernels"]:
         ir = pdir / f"{k['entry']}.ir.json"
-        r = subprocess.run([sys.executable, str(ROOT / "compile.py"), str(ir), "--target", target],
-                           capture_output=True, text=True)
+        cmd = [sys.executable, str(ROOT / "compile.py"), str(ir), "--target", target]
+        if level is not None:
+            cmd += ["--level", str(level)]
+        r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode:
             return False, f"compile.py failed: {(r.stderr.strip().splitlines() or ['?'])[-1]}"
         try:
@@ -128,12 +130,13 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("problems", type=Path, help="a problems folder")
     ap.add_argument("--only", default="", help="only problems whose name starts with this")
+    ap.add_argument("--level", type=int, choices=(0, 1, 2), help="force an optimization level")
     args = ap.parse_args()
     target = init()
     problems = sorted(p for p in args.problems.iterdir() if (p / "meta.json").exists() and p.name.startswith(args.only))
     passed = 0
     for p in problems:
-        ok, detail = run_problem(p, target)
+        ok, detail = run_problem(p, target, args.level)
         passed += ok
         print(f"{'PASS' if ok else 'FAIL'}  {p.name:28s} {detail}", flush=True)
     print(f"\n{passed}/{len(problems)} passed on the local GPU ({target})")

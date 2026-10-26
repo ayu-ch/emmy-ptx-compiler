@@ -580,20 +580,38 @@ class KernelCompiler(IntMath, LoopLowering):
         """`a[, b, c, d] = load buf[index]`: one value, or 2/4 consecutive ones in one vector load."""
         buf = self.buffer(s.input)
         flat = self.flat_index(buf, s.index)
-        n = len(s.names)
+        # A buffer the kernel never writes holds the same values at the same address, so a load
+        # already done in this block (or an enclosing one) is reused instead of repeated.
+        reusable = buf.name not in self.written
+        if reusable:
+            key = ("load", self.address(buf, flat), len(s.names))
+            regs = self._cse_get(key)
+            if regs is not None:
+                self.env.update(zip(s.names, regs))
+                return
+        regs = self._emit_load(buf, flat, s.names)
+        if reusable:
+            self.remember(key, regs)
+
+    def _emit_load(self, buf: Buffer, flat: Val, names) -> list[Val]:
+        n = len(names)
         raw_ty = ELEM[buf.dtype][1]
         if buf.dtype == "f16":                            # load the 16 bits, then widen to f32
             raws = [self.em.reg("b16") for _ in range(n)]
         else:
-            raws = [self.define(name, "s32" if buf.dtype == "i32" else "f32") for name in s.names]
+            raws = [self.define(name, "s32" if buf.dtype == "i32" else "f32") for name in names]
         if n in (2, 4):
             self.em.emit(f"ld.{buf.space}.v{n}.{raw_ty} {{{', '.join(map(str, raws))}}}, {self.address(buf, flat)}")
         else:
             for k, r in enumerate(raws):
                 self.em.emit(f"ld.{buf.space}.{raw_ty} {r}, {self.address(buf, flat, k)}")
-        if buf.dtype == "f16":
-            for name, r in zip(s.names, raws):
-                self.em.emit(f"cvt.f32.f16 {self.define(name, 'f32')}, {r}")
+        if buf.dtype != "f16":
+            return raws
+        out = []
+        for name, r in zip(names, raws):
+            out.append(self.define(name, "f32"))
+            self.em.emit(f"cvt.f32.f16 {out[-1]}, {r}")
+        return out
 
     def visit_Write(self, s) -> None:
         """`buf[index] = (v0[, v1, ...])`: a store, a vector store, or an atomic add."""
