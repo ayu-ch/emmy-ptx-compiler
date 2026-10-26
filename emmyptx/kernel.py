@@ -198,14 +198,17 @@ class KernelCompiler(IntMath, LoopLowering):
             align = max(int(s.align or 0), esize, 4)
             symbol = s.name if s.name not in uses else f"{s.name}_{uses[s.name]}"
             uses[s.name] = uses.get(s.name, 0) + 1
-            base = em.reg("s32")
-            if dynamic:
+            if dynamic:                                   # carve the array out of the pool
                 offset = (offset + 15) // 16 * 16
-                em.emit(f"add.s32 {base}, {pool}, {offset}")
+                base = pool
+                if offset:
+                    base = em.reg("s32")
+                    em.emit(f"add.s32 {base}, {pool}, {offset}")
                 offset += nbytes
                 align = 16
-            else:
+            else:                                         # a static array of its own
                 self.smem_decls.append(f".shared .align {align} .b8 {symbol}[{nbytes}];")
+                base = em.reg("s32")
                 em.emit(f"mov.u32 {base}, {symbol}")
             self.smem_for[id(s)] = Buffer(s.name, "shared", base, tuple(int(e) for e in s.extents), dtype, align)
         if dynamic and offset > self.launch["smem_bytes"]:
