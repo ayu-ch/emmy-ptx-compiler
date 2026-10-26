@@ -137,18 +137,18 @@ m01 copies tiles of A and B into shared memory with `cp.async`, in a 3-stage pip
 runs an inner `for _ki in 0..64` loop marked `unroll`:
 
 ```
-    cp.async.cg.shared.global [%r28], [%rd7], 16;
-    cp.async.cg.shared.global [%r28+8192], [%rd7+65536], 16;   // same registers, constant offsets
+    cp.async.cg.shared.global [%r27], [%rd7], 16;
+    cp.async.cg.shared.global [%r27+8192], [%rd7+65536], 16;   // same registers, constant offsets
     ...
     cp.async.wait_group 2;
     bar.sync 0;
     ...
-    ld.shared.v2.f32 {%f5, %f6}, [%r86];     // B[k, 2u] and B[k, 2u+1]: one paired load
+    ld.shared.v2.f32 {%f5, %f6}, [%r85];     // B[k, 2u] and B[k, 2u+1]: one paired load
     ...
-    ld.shared.f32 %f7, [%r96];               // A[2v, k]
+    ld.shared.f32 %f7, [%r95];               // A[2v, k]
     fma.rn.f32 %f1, %f5, %f7, %f1;           // acc += a * b
     fma.rn.f32 %f2, %f6, %f7, %f2;
-    ld.shared.f32 %f10, [%r96+256];          // A[2v+1, k]: the next row, a constant away
+    ld.shared.f32 %f10, [%r95+256];          // A[2v+1, k]: the next row, a constant away
 ```
 
 - **Dynamic shared memory.** The two tiles need 72 KiB, above the 48 KiB that static
