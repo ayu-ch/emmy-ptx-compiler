@@ -126,7 +126,7 @@ $L4_tree_skip:
   between threads, the later copies would get exit checks.)
 - **`WarpShuffle` and `TreeHalve` don't know they are summing.** They move the state and then
   compile the IR's own `combine_states` program, which is ordinary `Assign`s. In r01 that's
-  `acc0 = add(acc0, acc0__o)`. In f02 (softmax) it's eight assignments merging two
+  `acc0 = add(acc0, acc0__o)`. In f02 (softmax) it's nine assignments merging two
   (max, sum) pairs, and the same code handles it.
 - **Barriers sit outside conditional code.** Threads that skip a tree level jump *to* the
   barrier, never past it.
@@ -172,7 +172,7 @@ runs an inner `for _ki in 0..64` loop marked `unroll`:
 f02's online softmax keeps two accumulators, a running max `acc0` and a running sum `acc1`.
 The sum is an `Accum` with a `base`: `acc1 <- add(sa, sb)` means `acc1 = sa + sb`, where `sa`
 is the old sum rescaled by `exp(old max - new max)`. It's compiled exactly like any other
-`Accum`. The cross-thread merge is the 8-statement `combine_states` program.
+`Accum`. The cross-thread merge is the 9-statement `combine_states` program.
 
 `exp` is not a PTX instruction. `ops.py` computes `ex2.approx.f32(x * log2(e))`, and builds
 tanh, erf (for GELU), sigmoid, log and pow out of the few math instructions PTX has.
