@@ -1,0 +1,57 @@
+"""Elementwise ops, one or two inputs, and broadcasting."""
+
+from torch_cases import ROUND, TRANS, case
+
+N = "x = torch.randn(4096)"
+N2 = "x = torch.randn(2048); y = torch.randn(2048)"
+
+CASES = [
+    case("p_abs", f"{N}; torch.abs(x)", ROUND),
+    case("p_neg_sub", f"{N2}; -x - y", ROUND),
+    case("p_div", f"{N2}; x / (y.abs() + 0.5)", ROUND),
+    case("p_max_min", f"{N2}; torch.maximum(x, y) + torch.minimum(x, y)", ROUND),
+    case("p_exp", f"{N}; torch.exp(x)", TRANS),
+    case("p_log", f"{N}; torch.log(x.abs() + 0.5)", TRANS),
+    case("p_sqrt_rsqrt", f"{N}; torch.sqrt(x.abs()) + torch.rsqrt(x.abs() + 0.1)", TRANS),
+    case("p_reciprocal", f"{N}; torch.reciprocal(x.abs() + 0.5)", ROUND),
+    case("p_sigmoid", f"{N}; torch.sigmoid(x)", TRANS),
+    case("p_tanh", f"{N}; torch.tanh(x)", TRANS),
+    case("p_relu", f"{N}; torch.relu(x)", ROUND),
+    case("p_gelu_erf", f"{N}; F.gelu(x)", TRANS),
+    case("p_gelu_tanh", f"{N}; F.gelu(x, approximate='tanh')", TRANS),
+    case("p_silu", f"{N}; F.silu(x)", TRANS),
+    case("p_softplus", f"{N}; F.softplus(x)", TRANS),
+    case("p_mish", f"{N}; F.mish(x)", TRANS),
+    case("p_elu", f"{N}; F.elu(x)", TRANS),
+    case("p_leaky_relu", f"{N}; F.leaky_relu(x, 0.1)", ROUND),
+    case("p_hardtanh", f"{N}; F.hardtanh(x)", ROUND),
+    case("p_hardswish", f"{N}; F.hardswish(x)", ROUND),
+    case("p_relu6", f"{N}; F.relu6(x * 4)", ROUND),
+    case("p_erf", f"{N}; torch.erf(x)", TRANS),
+    case("p_sin_cos", f"{N}; torch.sin(x * 3) + torch.cos(x * 3)", TRANS),
+    case("p_log1p", f"{N}; torch.log1p(x.abs())", TRANS),
+    case("p_expm1", f"{N}; torch.expm1(x)", TRANS),
+    case("p_floor", f"{N}; torch.floor(x * 3)", ROUND),
+    case("p_floor_ceil", f"{N}; torch.floor(x * 3) + torch.ceil(x * 5)", ROUND),
+    case("p_round", f"{N}; torch.round(x * 3)", ROUND),
+    case("p_trunc", f"{N}; torch.trunc(x * 3)", ROUND),
+    case("p_sign", f"{N}; torch.sign(x)", ROUND),
+    case("p_exp2_log2", f"{N}; torch.exp2(x) + torch.log2(x.abs() + 0.5)", TRANS),
+    case("p_atan", f"{N}; torch.atan(x)", TRANS),
+    case("p_atan2", f"{N2}; torch.atan2(x, y)", TRANS),
+    case("p_square_cube", f"{N}; x ** 2 + x ** 3", ROUND),
+    case("p_pow_frac", f"{N}; torch.pow(x.abs() + 0.1, 0.7)", TRANS),
+    case("p_pow_tensor", f"{N2}; torch.pow(x.abs() + 0.1, y)", dict(rtol=1e-4, atol=1e-5)),
+    case("p_clamp", f"{N}; torch.clamp(x, -0.5, 0.5)", ROUND),
+    case("p_where", f"{N}; torch.where(x > 0, x, x * 0.1)", ROUND),
+    case("p_masked_fill", f"{N}; x.masked_fill(x < 0, 0.0)", ROUND),
+    case("p_cmp_to_float", f"{N2}; (x > y).float()", ROUND),
+    case("p_cmp_bool_out", f"{N2}; x > y", ROUND),
+    case("p_lerp", f"{N2}; torch.lerp(x, y, 0.3)", ROUND),
+    case("p_addcmul", "x = torch.randn(2048); y = torch.randn(2048); z = torch.randn(2048); "
+                      "torch.addcmul(x, y, z, value=0.5)", ROUND),
+    case("p_fmod", f"{N}; torch.fmod(x * 5, 1.5)", TRANS),
+    case("p_remainder", f"{N}; torch.remainder(x * 5, 1.5)", TRANS),
+    case("p_floor_divide", f"{N}; torch.floor_divide(x * 5, 1.5)", ROUND),
+    case("p_bcast_rowcol", "x = torch.randn(64, 128); r = torch.randn(128); c = torch.randn(64, 1); x * r + c", ROUND),
+]

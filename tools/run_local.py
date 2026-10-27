@@ -19,7 +19,7 @@ from pathlib import Path
 import numpy as np
 
 ROOT = Path(__file__).resolve().parent.parent
-cuda = ctypes.CDLL("libcuda.so.1")
+cuda = ctypes.CDLL("nvcuda.dll" if sys.platform == "win32" else "libcuda.so.1")
 # Pointers and sizes are passed as c_void_p / c_size_t explicitly: by default ctypes would pass
 # Python ints as 32-bit C ints, truncating the host addresses of large numpy arrays.
 DTYPES = {"f32": np.float32, "f16": np.float16, "f64": np.float64, "i32": np.int32, "i64": np.int64}
