@@ -7,16 +7,22 @@ PTX has only a handful of math instructions (`ex2.approx`, `lg2.approx`, `rcp`, 
 `sin.approx`, ...), so the transcendental functions are built from them the way a C math
 library is built. Plain `add.f32` / `mul.f32` are emitted without a rounding modifier, which
 lets ptxas fuse a multiply and an add into an FMA exactly as nvcc does for Emmy's own kernels.
+
+`exp` and `log` are as accurate as libm's `expf` / `logf`, which Emmy's CUDA calls for them;
+only `exp_fast` (Emmy's opt-in FAST_EXP rewrite, `__expf` in its CUDA) is one `ex2.approx`.
 """
 
 from __future__ import annotations
 
 import math
+import struct
 
 from .ptx import Emitter, Val, const_f32
 
 LOG2_E = 1.4426950408889634   # exp(x) = 2^(x * log2(e))
 LN_2 = 0.6931471805599453     # log(x) = log2(x) * ln(2)
+LN_2_HI = struct.unpack(">f", struct.pack(">f", LN_2))[0]   # ln(2) = LN_2_HI + LN_2_LO,
+LN_2_LO = LN_2 - LN_2_HI                                     # both f32, to about 2^-48
 TWO_PI = 2.0 * math.pi
 
 
@@ -33,16 +39,87 @@ def _bin(em: Emitter, instr: str, dst: Val, a: Val, b: Val) -> None:
     em.emit(f"{instr} {dst}, {_reg(em, a)}, {b}")
 
 
-def _exp(em: Emitter, dst: Val, x: Val) -> None:
+def _exp_fast(em: Emitter, dst: Val, x: Val) -> None:
+    """2^(x log2 e) in the hardware's approximation: the rounding of x log2 e grows with |x|."""
     t = em.reg("f32")
     em.emit(f"mul.f32 {t}, {_reg(em, x)}, {const_f32(LOG2_E)}")
     em.emit(f"ex2.approx.f32 {dst}, {t}")
 
 
+def _exp(em: Emitter, dst: Val, x: Val) -> None:
+    """exp(x) within about an ulp. x = n ln2 + r with n an integer and |r| <= ln2 / 2 (ln2 in
+    two parts, so r is nearly exact); e^r from its Taylor polynomial to r^7 (the next term is
+    below 1e-8); then 2^n applied as two exact powers of two, so an overflow gives inf and a
+    subnormal result is rounded once. `dst` may be `x`."""
+    xr = _reg(em, x)
+    nan = em.reg("pred")
+    em.emit(f"setp.nan.f32 {nan}, {xr}, {xr}")
+    xc, n, r, p, s1, s2 = (em.reg("f32") for _ in range(6))
+    em.emit(f"max.f32 {xc}, {xr}, {const_f32(-104.0)}")         # e^-104 rounds to 0
+    em.emit(f"min.f32 {xc}, {xc}, {const_f32(89.0)}")           # e^89 overflows
+    em.emit(f"mul.rn.f32 {n}, {xc}, {const_f32(LOG2_E)}")
+    em.emit(f"cvt.rni.f32.f32 {n}, {n}")
+    em.emit(f"fma.rn.f32 {r}, {n}, {const_f32(-LN_2_HI)}, {xc}")
+    em.emit(f"fma.rn.f32 {r}, {n}, {const_f32(-LN_2_LO)}, {r}")
+    em.emit(f"mov.f32 {p}, {const_f32(1 / math.factorial(7))}")
+    for k in range(6, -1, -1):                                  # Horner: sum of r^k / k!
+        em.emit(f"fma.rn.f32 {p}, {p}, {r}, {const_f32(1 / math.factorial(k))}")
+    lo, hi = em.reg("s32"), em.reg("s32")
+    em.emit(f"cvt.rzi.s32.f32 {hi}, {n}")
+    em.emit(f"shr.s32 {lo}, {hi}, 1")                           # n = lo + hi, both in [-75, 64]
+    em.emit(f"sub.s32 {hi}, {hi}, {lo}")
+    for e, s in ((lo, s1), (hi, s2)):                           # 2^e = the float with bits (e + 127) << 23
+        em.emit(f"add.s32 {e}, {e}, 127")
+        em.emit(f"shl.b32 {e}, {e}, 23")
+        em.emit(f"mov.b32 {s}, {e}")
+    em.emit(f"mul.rn.f32 {p}, {p}, {s1}")
+    em.emit(f"mul.rn.f32 {dst}, {p}, {s2}")
+    em.emit(f"@{nan} mov.f32 {dst}, 0f7FFFFFFF")
+
+
 def _log(em: Emitter, dst: Val, x: Val) -> None:
-    t = em.reg("f32")
-    em.emit(f"lg2.approx.f32 {t}, {_reg(em, x)}")
-    em.emit(f"mul.f32 {dst}, {t}, {const_f32(LN_2)}")
+    """log(x) within about an ulp, also near x = 1. x = m 2^e with m in [sqrt(1/2), sqrt(2)), so
+    f = m - 1 is exact and log(1 + f) = f - (h - s (h + R)), where h = f^2 / 2, s = f / (2 + f)
+    and R = 2 s^2/3 + 2 s^4/5 + 2 s^6/7 + 2 s^8/9 from log(1 + f) = 2 atanh(s). That arrangement
+    is fdlibm's logf: it keeps the large term f exact. Then e ln2 is added in two parts."""
+    xr = _reg(em, x)
+    pos, zero, inf, small = (em.reg("pred") for _ in range(4))
+    em.emit(f"setp.gt.f32 {pos}, {xr}, {const_f32(0.0)}")
+    em.emit(f"setp.eq.f32 {zero}, {xr}, {const_f32(0.0)}")
+    em.emit(f"setp.eq.f32 {inf}, {xr}, 0f7F800000")
+    em.emit(f"setp.lt.f32 {small}, {xr}, 0f00800000")          # subnormal (or not positive)
+    xs, m, ef, f, s, z, R, h, t, lo = (em.reg("f32") for _ in range(10))
+    em.emit(f"mul.rn.f32 {xs}, {xr}, 0f4B000000")             # times 2^23: now normal
+    em.emit(f"selp.f32 {xs}, {xs}, {xr}, {small}")
+    i, e, mb = (em.reg("s32") for _ in range(3))
+    em.emit(f"mov.b32 {i}, {xs}")
+    em.emit(f"sub.s32 {e}, {i}, 0x3F3504F3")                  # 0x3F3504F3 = sqrt(1/2)
+    em.emit(f"shr.s32 {e}, {e}, 23")
+    em.emit(f"shl.b32 {mb}, {e}, 23")
+    em.emit(f"sub.s32 {mb}, {i}, {mb}")                        # m = x / 2^e
+    em.emit(f"@{small} sub.s32 {e}, {e}, 23")
+    em.emit(f"mov.b32 {m}, {mb}")
+    em.emit(f"cvt.rn.f32.s32 {ef}, {e}")
+    em.emit(f"sub.rn.f32 {f}, {m}, {const_f32(1.0)}")
+    em.emit(f"add.rn.f32 {t}, {f}, {const_f32(2.0)}")
+    em.emit(f"div.rn.f32 {s}, {f}, {t}")
+    em.emit(f"mul.rn.f32 {z}, {s}, {s}")
+    em.emit(f"mov.f32 {R}, {const_f32(2 / 9)}")
+    for c in (2 / 7, 2 / 5, 2 / 3):
+        em.emit(f"fma.rn.f32 {R}, {R}, {z}, {const_f32(c)}")
+    em.emit(f"mul.rn.f32 {R}, {R}, {z}")
+    em.emit(f"mul.rn.f32 {h}, {f}, {const_f32(0.5)}")
+    em.emit(f"mul.rn.f32 {h}, {h}, {f}")
+    em.emit(f"mul.rn.f32 {lo}, {ef}, {const_f32(LN_2_LO)}")
+    em.emit(f"add.rn.f32 {t}, {h}, {R}")
+    em.emit(f"fma.rn.f32 {t}, {s}, {t}, {lo}")                 # s (h + R) + e ln2_lo
+    em.emit(f"sub.rn.f32 {t}, {h}, {t}")
+    em.emit(f"sub.rn.f32 {t}, {t}, {f}")
+    em.emit(f"neg.f32 {t}, {t}")
+    em.emit(f"fma.rn.f32 {dst}, {ef}, {const_f32(LN_2_HI)}, {t}")
+    em.emit(f"@!{pos} mov.f32 {dst}, 0f7FFFFFFF")               # log of a negative or NaN
+    em.emit(f"@{zero} mov.f32 {dst}, 0fFF800000")
+    em.emit(f"@{inf} mov.f32 {dst}, 0f7F800000")
 
 
 def _select01(em: Emitter, dst: Val, cmp: str, a: Val, b: Val) -> None:
@@ -170,8 +247,10 @@ def lower_op(em: Emitter, name: str, args: list[Val], dst: Val) -> None:
         t = em.reg("f32")
         em.emit(f"sqrt.rn.f32 {t}, {_reg(em, a)}")
         em.emit(f"rcp.rn.f32 {dst}, {t}")
-    elif name in ("exp", "exp_fast"):
+    elif name == "exp":
         _exp(em, dst, a)
+    elif name == "exp_fast":
+        _exp_fast(em, dst, a)
     elif name == "log":
         _log(em, dst, a)
     elif name == "sigmoid":                              # 1 / (1 + exp(-x))
