@@ -93,6 +93,10 @@ class KernelCompiler(IntMath, LoopLowering, TensorCoreLowering):
         # Optimization level: 2 = everything; 1 = no complete unrolling beyond what the IR asks
         # for; 0 = the plain lowering: no optional unrolling, load hoisting or load pairing.
         self.level = level
+        # Registers per thread with which a block of the launch's size still fits the 64K-register
+        # file (allocated per warp, 256 at a time); 255 is the most one thread can have.
+        warps = -(-math.prod(launch.get("block", [1])) // 32)
+        self.reg_budget = min(255, 65536 // (warps * 256) * 8)
         self.em = Emitter()
         self.init_intmath()
         self.env: dict[str, Val] = {}
@@ -139,6 +143,7 @@ class KernelCompiler(IntMath, LoopLowering, TensorCoreLowering):
             f".visible .entry {self.kernel.name}(",
             ",\n".join(params),
             ")",
+            *self._block_bound(),
             "{",
             *self.em.declarations(),
             "",
@@ -148,6 +153,15 @@ class KernelCompiler(IntMath, LoopLowering, TensorCoreLowering):
             "}",
             "",
         ])
+
+    def _block_bound(self) -> list[str]:
+        """`.maxntid` for blocks of over 256 threads, so ptxas keeps to the registers such a block
+        can have (as `__launch_bounds__` does for nvcc); without it a kernel that ptxas gives
+        more fails to launch. Smaller blocks fit any allocation and get no directive."""
+        if self.reg_budget >= 255:
+            return []
+        dims = [*self.launch.get("block", []), 1, 1, 1][:3]
+        return [f".maxntid {dims[0]}, {dims[1]}, {dims[2]}"]
 
     def _prologue(self) -> list[str]:
         """Parameters in meta.json's `arg_order`, shared arrays, and the thread's lane / warp."""

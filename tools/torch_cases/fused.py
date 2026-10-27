@@ -20,6 +20,12 @@ CASES = [
                         "-(F.log_softmax(x, -1) * torch.softmax(p, -1)).sum(-1).mean()", dict(rtol=1e-3, atol=1e-4)),
     case("f_sdpa", "q = torch.randn(1, 2, 64, 32); k = torch.randn(1, 2, 64, 32); v = torch.randn(1, 2, 64, 32); "
                    "F.scaled_dot_product_attention(q, k, v)", MM),
+    # Launched with 512-thread blocks: fully unrolling its dot products used to need more
+    # registers than such a block can have, and the launch failed.
+    case("f_sdpa_f16", "q = torch.randn(1, 4, 128, 64, dtype=torch.float16); "
+                       "k = torch.randn(1, 4, 128, 64, dtype=torch.float16); "
+                       "v = torch.randn(1, 4, 128, 64, dtype=torch.float16); F.scaled_dot_product_attention(q, k, v)",
+         dict(rtol=1e-2, atol=1e-2)),
     # A causal mask made inside the expression (torch.ones(...).tril()) would be fed random data
     # like any graph input, so the mask is taken from the scores: s.triu(1) != 0 above the diagonal.
     case("f_masked_attn_manual",

@@ -129,7 +129,25 @@ class LoopLowering:
             return unroll and trips <= UNROLL_MAX and size <= FULL_UNROLL_STMTS
         if unroll and trips <= UNROLL_MAX and size <= FLAGGED_UNROLL_STMTS:
             return True
+        if self.reg_budget < 255 and trips * self._unrolled_loads(body) > self.reg_budget // 2:
+            # A block of over 256 threads has fewer registers per thread than ptxas wants for
+            # this many loads issued together: it would spill, or the block would not launch.
+            return False
         return self.unroll_factor(body) > 1 and size <= FULL_UNROLL_STMTS
+
+    def _unrolled_loads(self, body) -> int:
+        """Values `body` loads, counting the copies of inner loops that unroll."""
+        n = 0
+        for t in body:
+            kind = type(t).__name__
+            if kind == "Load":
+                n += len(t.names)
+            elif kind == "Loop":
+                trips = int(t.axis.extent.as_static())
+                n += self._unrolled_loads(t.body) * (trips if self.fully_unrolled(trips, t.body, t.unroll) else 1)
+            else:
+                n += sum(self._unrolled_loads(sub) for sub in children(t))
+        return n
 
     def _unrolled_size(self, body) -> int:
         """Statements `body` expands to, counting the copies of inner loops that unroll."""
