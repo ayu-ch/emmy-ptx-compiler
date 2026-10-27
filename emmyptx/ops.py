@@ -222,6 +222,8 @@ _INT_OPS = {"add": "add.s32", "subtract": "sub.s32", "multiply": "mul.lo.s32",
 def lower_int_op(em: Emitter, name: str, args: list[Val], dst: Val) -> None:
     if name == "copy":
         em.emit(f"mov.b32 {dst}, {args[0]}")
+    elif name == "abs":
+        em.emit(f"abs.s32 {dst}, {_reg(em, args[0])}")
     elif name in _INT_OPS:
         _bin(em, _INT_OPS[name], dst, args[0], args[1])
     else:

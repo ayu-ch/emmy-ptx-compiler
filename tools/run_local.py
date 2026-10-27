@@ -22,9 +22,23 @@ ROOT = Path(__file__).resolve().parent.parent
 cuda = ctypes.CDLL("nvcuda.dll" if sys.platform == "win32" else "libcuda.so.1")
 # Pointers and sizes are passed as c_void_p / c_size_t explicitly: by default ctypes would pass
 # Python ints as 32-bit C ints, truncating the host addresses of large numpy arrays.
-DTYPES = {"f32": np.float32, "f16": np.float16, "f64": np.float64, "i32": np.int32, "i64": np.int64}
+DTYPES = {"f32": np.float32, "f16": np.float16, "f64": np.float64, "i32": np.int32, "i64": np.int64,
+          "bool": np.bool_, "bf16": np.uint16}             # numpy has no bf16: its bits, see to_device
 CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8
 CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 75, 76
+
+
+def to_device(values, dtype: str) -> np.ndarray:
+    """`values` as a buffer of `dtype` holds them. bf16 is the upper half of the f32 bits,
+    rounded to nearest even, as torch's `.bfloat16()` rounds."""
+    if dtype != "bf16":
+        return np.asarray(values).astype(DTYPES[dtype])
+    bits = np.asarray(values, dtype=np.float32).view(np.uint32)
+    return ((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16).astype(np.uint16)
+
+
+def from_device(raw: np.ndarray, dtype: str) -> np.ndarray:
+    return (raw.astype(np.uint32) << 16).view(np.float32) if dtype == "bf16" else raw
 
 
 def check(err: int, what: str) -> None:
@@ -70,11 +84,11 @@ def run_kernel(ptx: str, k: dict, produced: dict) -> dict:
             holders.append(ctypes.c_float(a["value"]) if a["dtype"] == "f32" else ctypes.c_int32(a["value"]))
         else:
             if "seed" in a:
-                host = np.random.default_rng(a["seed"]).standard_normal(shape).astype(dtype)
+                host = to_device(np.random.default_rng(a["seed"]).standard_normal(shape), a["dtype"])
             elif "data" in a:
-                host = np.asarray(a["data"], dtype=dtype).reshape(shape)
+                host = to_device(np.asarray(a["data"]).reshape(shape), a["dtype"])
             elif a.get("intermediate"):
-                host = np.asarray(produced[a["name"]], dtype=dtype).reshape(shape)
+                host = to_device(np.asarray(produced[a["name"]]).reshape(shape), a["dtype"])
             else:
                 host = np.zeros(shape, dtype)
             dev = ctypes.c_uint64()
@@ -92,7 +106,7 @@ def run_kernel(ptx: str, k: dict, produced: dict) -> dict:
             dev, host = arrays[a["name"]]
             out = np.empty_like(host)
             check(cuda.cuMemcpyDtoH_v2(ctypes.c_void_p(out.ctypes.data), dev, ctypes.c_size_t(out.nbytes)), "copy out")
-            outputs[a["name"]] = out
+            outputs[a["name"]] = from_device(out, a["dtype"])
     for dev, _ in arrays.values():
         cuda.cuMemFree_v2(dev)
     cuda.cuModuleUnload(module)
@@ -118,9 +132,10 @@ def run_problem(pdir: Path, target: str, level: int | None = None) -> tuple[bool
         for name, got in outs.items():
             produced[name] = got
             if name in expected:
-                ref = expected[name]
-                err = float(np.max(np.abs(got.reshape(ref.shape) - ref))) if ref.size else 0.0
-                if not np.allclose(got.reshape(ref.shape), ref, rtol=meta["rtol"], atol=meta["atol"]):
+                ref = expected[name].astype(np.float64)           # (bool outputs cannot be subtracted)
+                got = got.reshape(ref.shape).astype(np.float64)
+                err = float(np.max(np.abs(got - ref))) if ref.size else 0.0
+                if not np.allclose(got, ref, rtol=meta["rtol"], atol=meta["atol"]):
                     return False, f"{name}: max abs err {err:.3e} (rtol={meta['rtol']} atol={meta['atol']})"
                 report.append(f"{name}: max abs err {err:.3e}")
     return True, "; ".join(report)

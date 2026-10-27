@@ -26,8 +26,14 @@ from .loops import LoopLowering, defines, walk
 from .ops import lower_int_op, lower_op
 from .ptx import Emitter, Val, const_f32, const_int, const_pred
 
-# Element types of buffers: bytes per element and the PTX type used to load / store them.
-ELEM = {"f32": (4, "f32"), "f16": (2, "b16"), "i32": (4, "s32")}
+# Element types of buffers: bytes per element, the PTX type used to load / store them, and the
+# register class of the raw element when it is converted on load and store (None: no conversion).
+# Values are computed as f32 (f16, bf16, and bool as Emmy's 1.0 / 0.0 masks) or s32 (i64).
+ELEM = {"f32": (4, "f32", None), "i32": (4, "s32", None), "f16": (2, "b16", "b16"), "bf16": (2, "b16", "b16"),
+        "bool": (1, "u8", "b16"), "i64": (8, "s64", "u64")}
+INT_BUFFERS = {"i32", "i64"}
+_WIDEN = {"f16": "cvt.f32.f16", "bf16": "cvt.f32.bf16", "bool": "cvt.rn.f32.u16"}
+_NARROW = {"f16": "cvt.rn.f16.f32", "bf16": "cvt.rn.bf16.f32"}
 SMEM_DTYPE = {"float": "f32", "__half": "f16", "half": "f16", "int": "i32"}
 # Integer dtypes. `bool` values (comparison results) are 1.0 / 0.0 floats, Emmy's mask convention.
 INT_DTYPES = {"int", "i32", "i64", "int32", "int64", "u32", "u8", "i8"}
@@ -158,8 +164,13 @@ class KernelCompiler(IntMath, LoopLowering):
             em.emit(f"ld.param.u64 {r}, [{name}]")
             em.emit(f"cvta.to.global.u64 {r}, {r}")
             shape, dtype = self.tensors.get(name, (tuple(arg.get("shape") or (1,)), arg.get("dtype", "f32")))
+            if dtype == "f64":
+                raise CompileError(f"buffer {name!r} is f64: emmyptx computes in f32, which would silently "
+                                   "lose the f64 precision")
             if dtype not in ELEM:
                 raise CompileError(f"buffer {name!r} has unsupported dtype {dtype!r}")
+            if dtype == "bf16" and int("".join(filter(str.isdigit, self.target)) or 0) < 80:
+                raise CompileError(f"buffer {name!r} is bf16, whose conversions need sm_80 or newer")
             self.buffers[name] = Buffer(name, "global", r, tuple(shape), dtype, align=256)  # cudaMalloc
         self._declare_shared()
         tid, lane, warp = em.reg("s32"), em.reg("s32"), em.reg("s32")
@@ -616,28 +627,70 @@ class KernelCompiler(IntMath, LoopLowering):
         if reusable:
             self.remember(key, regs)
 
+    @staticmethod
+    def _vector(buf: Buffer, n: int) -> bool:
+        """Whether n neighbouring elements move as one `.v2` / `.v4` access (of at most 16 bytes)."""
+        return n in (2, 4) and n * buf.esize <= 16
+
     def _emit_load(self, s, buf: Buffer, flat: Val) -> list[Val]:
         names = s.names
         n = len(names)
-        raw_ty = ELEM[buf.dtype][1]
-        if n in (2, 4):
+        _, raw_ty, raw_reg = ELEM[buf.dtype]
+        value_ty = "s32" if buf.dtype in INT_BUFFERS else "f32"
+        vector = self._vector(buf, n)
+        if vector:
             self.require_aligned(s, buf, flat, n * buf.esize)
-        if buf.dtype == "f16":                            # load the 16 bits, then widen to f32
-            raws = [self.em.reg("b16") for _ in range(n)]
-        else:
-            raws = [self.define(name, "s32" if buf.dtype == "i32" else "f32") for name in names]
-        if n in (2, 4):
+        if raw_reg is None:                               # straight into the names' registers
+            raws = [self.define(name, value_ty) for name in names]
+        else:                                             # load the raw elements, then widen them
+            raws = [self.em.reg(raw_reg) for _ in range(n)]
+        if vector:
             self.em.emit(f"ld.{buf.space}.v{n}.{raw_ty} {{{', '.join(map(str, raws))}}}, {self.address(buf, flat)}")
         else:
             for k, r in enumerate(raws):
                 self.em.emit(f"ld.{buf.space}.{raw_ty} {r}, {self.address(buf, flat, k)}")
-        if buf.dtype != "f16":
+        if raw_reg is None:
             return raws
         out = []
         for name, r in zip(names, raws):
-            out.append(self.define(name, "f32"))
-            self.em.emit(f"cvt.f32.f16 {out[-1]}, {r}")
+            out.append(self.define(name, value_ty))
+            self._widen(buf.dtype, r, out[-1])
         return out
+
+    def _widen(self, dtype: str, raw: Val, dst: Val) -> None:
+        """dst = a loaded raw element of a `dtype` buffer, as an f32 or s32 value."""
+        em = self.em
+        if dtype != "i64":
+            em.emit(f"{_WIDEN[dtype]} {dst}, {raw}")
+            return
+        # Integers are computed in 32 bits. A loaded value outside that range stops the kernel
+        # (trap) instead of wrapping around silently; arithmetic that leaves the range still wraps.
+        em.emit(f"cvt.s32.s64 {dst}, {raw}")
+        back, p = em.reg("u64"), em.reg("pred")
+        em.emit(f"cvt.s64.s32 {back}, {dst}")
+        em.emit(f"setp.ne.s64 {p}, {back}, {raw}")
+        em.emit(f"@{p} trap")
+
+    def _narrow(self, dtype: str, v: Val) -> Val:
+        """The register holding value `v` as stored in a `dtype` buffer."""
+        em = self.em
+        if dtype in INT_BUFFERS:
+            v = em.materialize(self.to_s32(v))
+            if dtype == "i32":
+                return v
+            raw = em.reg("u64")
+            em.emit(f"cvt.s64.s32 {raw}, {v}")
+            return raw
+        if dtype == "bool":                               # nonzero (or NaN) is True, as in torch
+            p, raw = self.to_pred(v), em.reg("b16")
+            em.emit(f"mov.b16 {raw}, {int(p.const)}" if p.is_const else f"selp.b16 {raw}, 1, 0, {p}")
+            return raw
+        v = em.materialize(self.to_f32(v))
+        if dtype == "f32":
+            return v
+        raw = em.reg("b16")
+        em.emit(f"{_NARROW[dtype]} {raw}, {v}")
+        return raw
 
     def visit_Write(self, s) -> None:
         """`buf[index] = (v0[, v1, ...])`: a store, a vector store, or an atomic add."""
@@ -646,22 +699,14 @@ class KernelCompiler(IntMath, LoopLowering):
         flat = self.flat_index(buf, s.index)
         if buf.space == "shared":
             flat = self.swizzle(flat, getattr(s, "swizzle", "NONE"))
-        vals = []
-        for name in s.values:
-            v = self.lookup(name)
-            v = self.to_s32(v) if buf.dtype == "i32" else self.to_f32(v)
-            if buf.dtype == "f16":
-                h = em.reg("b16")
-                em.emit(f"cvt.rn.f16.f32 {h}, {em.materialize(v)}")
-                v = h
-            vals.append(em.materialize(v))
+        vals = [self._narrow(buf.dtype, self.lookup(name)) for name in s.values]
         raw_ty = ELEM[buf.dtype][1]
         if s.atomic:                                      # split-K partial sums: each lane adds its own
             if buf.dtype != "f32":
                 raise CompileError("atomic writes are only supported for f32 buffers")
             for k, v in enumerate(vals):
                 em.emit(f"red.{buf.space}.add.f32 {self.address(buf, flat, k)}, {v}")
-        elif len(vals) in (2, 4):
+        elif self._vector(buf, len(vals)):
             self.require_aligned(s, buf, flat, len(vals) * buf.esize)
             em.emit(f"st.{buf.space}.v{len(vals)}.{raw_ty} {self.address(buf, flat)}, {{{', '.join(map(str, vals))}}}")
         else:

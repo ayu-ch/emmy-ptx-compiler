@@ -48,7 +48,7 @@ ROOT = TOOLS.parent
 sys.path.insert(0, str(TOOLS))
 import torch_cases  # noqa: E402
 
-DTYPES = {"f32": np.float32, "f16": np.float16, "f64": np.float64, "i32": np.int32, "i64": np.int64}
+DTYPES = {"f32": np.float32, "f16": np.float16, "f64": np.float64, "i32": np.int32, "i64": np.int64, "bool": np.bool_}
 
 # `emmy` in this Python. Emmy imports fcntl, which Windows lacks, only to flock its
 # working-golden cache; every trace here gets its own cache files, so a no-op lock is enough.
@@ -226,7 +226,8 @@ def reference(case: dict, pkg: dict) -> dict[str, np.ndarray]:
         if var is None or not isinstance(scope.get(var), torch.Tensor):
             raise StageError("reference", f"graph input {name!r} is not a tensor variable of the preamble")
         t = seeded_input(i, pkg["input_shapes"][name] or [1], pkg["input_dtypes"][name])
-        t = t.double() if t.is_floating_point() else t.long()
+        if t.dtype != torch.bool:                       # (masks stay masks)
+            t = t.double() if t.is_floating_point() else t.long()
         scope[var] = t.reshape(scope[var].shape)
     with torch.no_grad():
         out = eval(compile(ast.Expression(final), "<case>", "eval"), scope)
