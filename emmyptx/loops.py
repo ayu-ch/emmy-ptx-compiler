@@ -17,6 +17,8 @@ optional unrolling and the hoisting, for the smallest PTX.
 
 from __future__ import annotations
 
+import math
+
 from .ptx import Val, const_f32, const_int
 
 # Loops the IR marks `unroll` are unrolled completely up to this trip count and this many
@@ -193,6 +195,10 @@ class LoopLowering:
         r = self.range_of(start)
         if r is not None and end.is_const:                # inside the body: start <= i < end
             self.ranges[i.text] = (r[0], end.const - 1)
+        if step.is_const:                                 # i = start + n * step, for every n
+            m = math.gcd(self.mult_of(start), int(step.const))
+            if m > 1:
+                self.mults[i.text] = m
         factor = self.unroll_factor(body) if step.is_const else 1
         if trips is not None and trips < 2 * factor:
             factor = 1
@@ -276,9 +282,11 @@ class LoopLowering:
             saved = {name: self.env.get(name) for name in bound}
             self.env.update({name: const_int(k) for name, k in bound.items()})
             buf = self.buffers[load.input]
-            addr = self.address(buf, self.flat_index(buf, load.index))
+            flat = self.flat_index(buf, load.index)
+            addr = self.address(buf, flat)
             key = (buf.name, addr, n)
-            if key not in table:
+            # A vector load not proven aligned stays in the loop, where visit_Load reports it.
+            if key not in table and (n == 1 or self.known_alignment(buf, flat) >= n * buf.esize):
                 regs = [self.em.reg("f32") for _ in load.names]
                 width = f".v{n}" if n > 1 else ""
                 self.em.emit(f"ld.global{width}.f32 {{{', '.join(map(str, regs))}}}, {addr}"

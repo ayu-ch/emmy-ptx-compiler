@@ -365,6 +365,10 @@ class KernelCompiler(IntMath, LoopLowering):
             return t
         r = self.em.reg(ty)
         self.em.emit(f"selp.{'b32' if ty == 's32' else ty} {r}, {t}, {f}, {p}")
+        if ty == "s32":                                   # either value: a multiple of what both are
+            m = math.gcd(self.mult_of(t), self.mult_of(f))
+            if m > 1:
+                self.mults[r.text] = m
         return r
 
     # =====================================================================================
@@ -431,6 +435,22 @@ class KernelCompiler(IntMath, LoopLowering):
             reg, off = r, 0
         return f"[{reg}+{off}]" if off else f"[{reg}]"
 
+    def known_alignment(self, buf: Buffer, flat: Val) -> int:
+        """The largest power of two the address of element `flat` of `buf` is known to be a
+        multiple of: the base's alignment and a known divisor of the byte offset."""
+        m = math.gcd(buf.align, self.mult_of(flat) * buf.esize)
+        return m & -m
+
+    def require_aligned(self, s, buf: Buffer, flat: Val, nbytes: int) -> None:
+        """Stop unless element `flat` of `buf` is provably `nbytes`-aligned. A PTX memory access
+        must be aligned to its whole size (a `.v4.f32` load or a 16-byte `cp.async` to 16
+        bytes); a misaligned one faults or silently reads other bytes."""
+        known = self.known_alignment(buf, flat)
+        if known < nbytes:
+            what = s.pretty()[0].strip() if hasattr(s, "pretty") else type(s).__name__
+            raise CompileError(f"{what}: this {nbytes}-byte access to {buf.name!r} needs a {nbytes}-byte aligned "
+                               f"address, and the index only proves {known}-byte alignment")
+
     # =====================================================================================
     # Statements
     # =====================================================================================
@@ -474,12 +494,12 @@ class KernelCompiler(IntMath, LoopLowering):
         """
         first = stmts[i]
         buf = self.buffers.get(first.input)
-        if buf is None or buf.dtype != "f32" or buf.align < 8:
+        if buf is None or buf.dtype != "f32":
             return None
         flat = self.flat_index(buf, first.index)
-        root, k = self.split(flat)
-        if k % 2 or (root is not None and self.mult_of(root) % 2):
+        if self.known_alignment(buf, flat) < 8:
             return None
+        root, k = self.split(flat)
         defined: set[str] = set(first.names)
         stoppers = {"Sync", "CpAsyncCopy", "CpAsyncWait", "Loop", "StridedLoop", "Cond", "TreeHalve", "Smem"}
         for j in range(i + 1, min(len(stmts), i + 32)):
@@ -592,13 +612,16 @@ class KernelCompiler(IntMath, LoopLowering):
             if regs is not None:
                 self.env.update(zip(s.names, regs))
                 return
-        regs = self._emit_load(buf, flat, s.names)
+        regs = self._emit_load(s, buf, flat)
         if reusable:
             self.remember(key, regs)
 
-    def _emit_load(self, buf: Buffer, flat: Val, names) -> list[Val]:
+    def _emit_load(self, s, buf: Buffer, flat: Val) -> list[Val]:
+        names = s.names
         n = len(names)
         raw_ty = ELEM[buf.dtype][1]
+        if n in (2, 4):
+            self.require_aligned(s, buf, flat, n * buf.esize)
         if buf.dtype == "f16":                            # load the 16 bits, then widen to f32
             raws = [self.em.reg("b16") for _ in range(n)]
         else:
@@ -639,6 +662,7 @@ class KernelCompiler(IntMath, LoopLowering):
             for k, v in enumerate(vals):
                 em.emit(f"red.{buf.space}.add.f32 {self.address(buf, flat, k)}, {v}")
         elif len(vals) in (2, 4):
+            self.require_aligned(s, buf, flat, len(vals) * buf.esize)
             em.emit(f"st.{buf.space}.v{len(vals)}.{raw_ty} {self.address(buf, flat)}, {{{', '.join(map(str, vals))}}}")
         else:
             for k, v in enumerate(vals):
@@ -651,8 +675,12 @@ class KernelCompiler(IntMath, LoopLowering):
         if s.lane_index is not None:                      # stripe base + this lane's (row, col)
             row, col = (self.to_s32(self.expr(e)) for e in s.lane_index)
             flat = self.iop("+", flat, self.iop("+", self.iop("*", row, const_int(dst.shape[-1])), col))
-        smem_addr = self.address(dst, self.swizzle(flat, s.swizzle))
-        gmem_addr = self.address(src, self.flat_index(src, s.src_index))
+        flat = self.swizzle(flat, s.swizzle)
+        self.require_aligned(s, dst, flat, s.nbytes)
+        smem_addr = self.address(dst, flat)
+        src_flat = self.flat_index(src, s.src_index)
+        self.require_aligned(s, src, src_flat, s.nbytes)
+        gmem_addr = self.address(src, src_flat)
         cache = "cg" if s.nbytes == 16 else "ca"          # .cg (bypass L1) only exists for 16 bytes
         self.em.emit(f"cp.async.{cache}.shared.global {smem_addr}, {gmem_addr}, {s.nbytes}")
 

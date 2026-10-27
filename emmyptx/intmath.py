@@ -12,8 +12,8 @@ optimizations that matter for the generated code:
   computed earlier in an enclosing block is reused.
 - Facts about values: ranges (`self.ranges`) and known divisors (`self.mults`). A value
   known to be non-negative divides unsigned (a shift for powers of two), a loop whose start
-  is a thread index still has a known trip count, and an even element offset proves the
-  8-byte alignment a paired load needs.
+  is a thread index still has a known trip count, and a known divisor of an element offset
+  proves the alignment a vector access needs.
 
 Integer registers are written once (see `KernelCompiler.define`), which is what makes caching
 them sound; loop counters, the one exception, are `forget`-ed before they change.
@@ -197,19 +197,26 @@ class IntMath:
         """A known divisor of an integer value (1 when nothing is known)."""
         if v.is_const:
             return abs(int(v.const)) or _HUGE
-        if v.text in self.affine:
-            base, k = self.affine[v.text]
-            return math.gcd(self.mult_of(base), abs(k) or _HUGE)
-        return self.mults.get(v.text, 1)
+        known = self.mults.get(v.text, 1)
+        if v.text in self.affine:                         # e.g. (x + 32) * 512 = mul(x, 512) + 16384:
+            base, k = self.affine[v.text]                 # both facts hold, keep the stronger one
+            return max(known, math.gcd(self.mult_of(base), abs(k) or _HUGE))
+        return known
 
     def _mult_after(self, op: str, a: Val, b: Val) -> int:
         ma, mb = self.mult_of(a), self.mult_of(b)
-        if op in ("+", "-"):
+        if op in ("+", "-", "%", "max", "min"):           # a % b = a - b * q
             return math.gcd(ma, mb)
         if op == "*":
             return min(ma * mb, _HUGE)
         if op == "<<" and b.is_const:
             return min(ma << int(b.const), _HUGE)
+        # Bitwise ops, by the low bits known to be zero: a bit of a & b is zero where either
+        # operand's is, a bit of a | b or a ^ b where both are (swizzles are XORs).
+        if op == "&":
+            return max(ma & -ma, mb & -mb)
+        if op in ("|", "^"):
+            return min(ma & -ma, mb & -mb)
         return 1
 
 

@@ -12,7 +12,7 @@ CASES = [
     case("m_addmm", "c = torch.randn(64, 48); a = torch.randn(64, 32); b = torch.randn(32, 48); "
                     "torch.addmm(c, a, b)", MM),
     # emmy-ml 0.3.11's schedule copies 16 bytes (cp.async) from an address that is not 16-byte
-    # aligned, in its own CUDA as well: the launch fails with a misaligned address.
+    # aligned, in its own CUDA as well. emmyptx cannot prove the alignment and stops at compile.
     case("m_transpose_lhs", "a = torch.randn(96, 128); b = torch.randn(96, 80); a.t() @ b", MM),
     # emmy-ml 0.3.11's IR reads only v[0] and has output shape [256, 128], not (256,).
     case("m_matvec", "a = torch.randn(256, 128); v = torch.randn(128); a @ v", MM),
