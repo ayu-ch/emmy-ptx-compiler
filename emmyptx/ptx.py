@@ -20,12 +20,15 @@ from dataclasses import dataclass
 #   u64  - addresses of global memory
 #   f32  - all floating-point math
 #   pred - the 1-bit results of comparisons
+#   b16  - 16-bit elements on their way to or from memory (f16, bf16, bool)
+#   b32  - tensor-core fragments: two 16-bit elements packed in one register
 REG_CLASS = {
     "pred": ("p", ".pred"),
     "s32": ("r", ".b32"),
     "u64": ("rd", ".b64"),
     "f32": ("f", ".f32"),
     "b16": ("h", ".b16"),
+    "b32": ("b", ".b32"),
 }
 
 

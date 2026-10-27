@@ -3,7 +3,8 @@
 One decision procedure picks the form of every loop (see `LoopLowering.loop`):
 
 1. Known trip count, small enough: unrolled completely. The loop variable is a constant in
-   every copy, so its index arithmetic folds into address offsets.
+   every copy, so its index arithmetic folds into address offsets. A loop whose variable
+   picks a tensor-core register fragment (`_b[_r0]`) is unrolled at any size and level.
 2. Trip count only known to lie in a small range (a cooperative loop `for i in tid..N:step`,
    where `tid` is a thread index): unrolled completely, with an exit check before each copy
    that might not run (`short_loop`).
@@ -106,7 +107,7 @@ class LoopLowering:
         trips = None
         if start.is_const and end.is_const and step.is_const and step.const > 0:
             trips = max(0, -(-(end.const - start.const) // step.const))
-        if trips is not None and self.fully_unrolled(trips, body, unroll):
+        if trips is not None and (var in self.fragment_index_vars(body) or self.fully_unrolled(trips, body, unroll)):
             for k in range(trips):
                 self.env[var] = const_int(start.const + k * step.const)
                 self.body(body)

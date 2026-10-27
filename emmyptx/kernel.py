@@ -8,7 +8,8 @@
 - expressions: `expr()` compiles Emmy's index / predicate trees, folding constants;
 - buffers: `address()` turns "element i of buffer B" into a PTX address operand;
 - statements: one `visit_<Kind>` method per Kernel IR statement. The loop statements live
-  in `loops.LoopLowering` and the integer arithmetic in `intmath.IntMath`.
+  in `loops.LoopLowering`, the tensor-core ones in `mma.TensorCoreLowering` and the integer
+  arithmetic in `intmath.IntMath`.
 
 Registers follow SSA, with one exception. Every definition gets a fresh register, except the
 *carried* names (accumulators, `Init` state, the states of `WarpShuffle` / `TreeHalve`),
@@ -23,6 +24,7 @@ from dataclasses import dataclass
 
 from .intmath import COMMUTATIVE, IntMath
 from .loops import LoopLowering, defines, walk
+from .mma import TensorCoreLowering
 from .ops import lower_int_op, lower_op
 from .ptx import Emitter, Val, const_f32, const_int, const_pred
 
@@ -34,7 +36,7 @@ ELEM = {"f32": (4, "f32", None), "i32": (4, "s32", None), "f16": (2, "b16", "b16
 INT_BUFFERS = {"i32", "i64"}
 _WIDEN = {"f16": "cvt.f32.f16", "bf16": "cvt.f32.bf16", "bool": "cvt.rn.f32.u16"}
 _NARROW = {"f16": "cvt.rn.f16.f32", "bf16": "cvt.rn.bf16.f32"}
-SMEM_DTYPE = {"float": "f32", "__half": "f16", "half": "f16", "int": "i32"}
+SMEM_DTYPE = {"float": "f32", "__half": "f16", "half": "f16", "__nv_bfloat16": "bf16", "int": "i32"}
 # Integer dtypes. `bool` values (comparison results) are 1.0 / 0.0 floats, Emmy's mask convention.
 INT_DTYPES = {"int", "i32", "i64", "int32", "int64", "u32", "u8", "i8"}
 # The runner accepts PTX up to 2,000,000 characters; past this the kernel is recompiled at a
@@ -80,13 +82,14 @@ def _dtype_name(dt) -> str | None:
     return None if dt is None else getattr(dt, "name", dt)
 
 
-class KernelCompiler(IntMath, LoopLowering):
+class KernelCompiler(IntMath, LoopLowering, TensorCoreLowering):
     error = CompileError
 
     def __init__(self, graph, kernel, launch: dict, target: str = "sm_89", level: int = 2) -> None:
         self.kernel = kernel
         self.launch = launch
         self.target = target
+        self.sm = int("".join(filter(str.isdigit, target)) or 0)   # sm_86 -> 86
         # Optimization level: 2 = everything; 1 = no complete unrolling beyond what the IR asks
         # for; 0 = the plain lowering: no optional unrolling, load hoisting or load pairing.
         self.level = level
@@ -101,6 +104,7 @@ class KernelCompiler(IntMath, LoopLowering):
         self.products: dict[str, tuple[Val, Val]] = {}   # lazy f32 product register -> (a, b)
         self.carried: set[str] = set()            # names whose register is updated in place
         self.carried_regs: set[str] = set()       # ... and those registers
+        self.frags: dict[str, tuple] = {}         # RegFragment name -> (role, dtype, registers)
         for s in walk(kernel.body):
             kind = type(s).__name__
             if kind in ("Accum", "Init"):
@@ -108,8 +112,8 @@ class KernelCompiler(IntMath, LoopLowering):
             elif kind in ("WarpShuffle", "TreeHalve"):
                 self.carried.update(s.state)
         # Buffers the kernel writes: their contents are never assumed to stay the same.
-        self.written = {getattr(t, "output", None) or getattr(t, "smem", None)
-                        for t in walk(kernel.body) if type(t).__name__ in ("Write", "CpAsyncCopy")}
+        self.written = {getattr(t, "output", None) or getattr(t, "smem", None) or getattr(t, "dst_buffer", None)
+                        for t in walk(kernel.body) if type(t).__name__ in ("Write", "CpAsyncCopy", "RegStore")}
         # Every tensor the graph knows: name -> (shape, dtype). Scalars count as one element.
         self.tensors = {}
         for node in graph.nodes.values():
@@ -169,7 +173,7 @@ class KernelCompiler(IntMath, LoopLowering):
                                    "lose the f64 precision")
             if dtype not in ELEM:
                 raise CompileError(f"buffer {name!r} has unsupported dtype {dtype!r}")
-            if dtype == "bf16" and int("".join(filter(str.isdigit, self.target)) or 0) < 80:
+            if dtype == "bf16" and self.sm < 80:
                 raise CompileError(f"buffer {name!r} is bf16, whose conversions need sm_80 or newer")
             self.buffers[name] = Buffer(name, "global", r, tuple(shape), dtype, align=256)  # cudaMalloc
         self._declare_shared()
@@ -181,7 +185,7 @@ class KernelCompiler(IntMath, LoopLowering):
         self.ranges[tid.text] = (0, block - 1)
         self.ranges[lane.text] = (0, min(block, 32) - 1)
         self.ranges[warp.text] = (0, (block - 1) // 32)
-        self.tid = tid
+        self.tid, self.lane = tid, lane
         self.env["lane"], self.env["warp"] = lane, warp
         return params
 
@@ -512,7 +516,8 @@ class KernelCompiler(IntMath, LoopLowering):
             return None
         root, k = self.split(flat)
         defined: set[str] = set(first.names)
-        stoppers = {"Sync", "CpAsyncCopy", "CpAsyncWait", "Loop", "StridedLoop", "Cond", "TreeHalve", "Smem"}
+        stoppers = {"Sync", "CpAsyncCopy", "CpAsyncWait", "Loop", "StridedLoop", "Cond", "TreeHalve", "Smem",
+                    "RegStore"}
         for j in range(i + 1, min(len(stmts), i + 32)):
             t = stmts[j]
             kind = type(t).__name__
